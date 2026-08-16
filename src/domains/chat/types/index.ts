@@ -1,0 +1,57 @@
+export interface IConversationMember {
+  id: string;
+  name: string;
+  email: string;
+  avatarUrl?: string | null;
+  publicKey?: string | null;
+  role: "admin" | "member";
+  status: "online" | "offline" | "away";
+  lastSeen?: string | null;
+}
+
+export interface IMessage {
+  id: string;
+  conversationId: string;
+  senderId: string;
+  content?: string | null;
+  type: "text" | "image" | "file" | "audio" | "system";
+  mediaUrl?: string | null;
+  replyToId?: string | null;
+  isEncrypted: boolean;
+  ciphertext?: string | null;
+  iv?: string | null;
+  isEdited: boolean;
+  isDeleted: boolean;
+  createdAt: string;
+  updatedAt: string;
+  sender: {
+    id: string;
+    name: string;
+    avatarUrl?: string | null;
+    publicKey?: string | null;
+  };
+  reactions?: Array<{
+    id: string;
+    emoji: string;
+    userId: string;
+  }>;
+}
+
+export interface IConversation {
+  id: string;
+  type: "direct" | "group";
+  title?: string | null;
+  avatarUrl?: string | null;
+  createdBy?: string | null;
+  lastMessageAt: string;
+  createdAt: string;
+  members: IConversationMember[];
+  latestMessage?: {
+    id: string;
+    content?: string | null;
+    type: string;
+    senderId: string;
+    createdAt: string;
+  } | null;
+  unreadCount?: number;
+}

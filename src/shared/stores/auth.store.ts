@@ -1,0 +1,40 @@
+import { create } from "zustand";
+import { IUser } from "@/domains/user/types";
+
+interface AuthState {
+  user: IUser | null;
+  token: string | null;
+  isAuthenticated: boolean;
+  setAuth: (user: IUser, token: string) => void;
+  updateUser: (user: Partial<IUser>) => void;
+  logout: () => void;
+}
+
+export const useAuthStore = create<AuthState>((set) => ({
+  user: typeof window !== "undefined" ? JSON.parse(localStorage.getItem("aljo_chat_user") || "null") : null,
+  token: typeof window !== "undefined" ? localStorage.getItem("aljo_chat_token") : null,
+  isAuthenticated: typeof window !== "undefined" ? !!localStorage.getItem("aljo_chat_token") : false,
+
+  setAuth: (user, token) => {
+    localStorage.setItem("aljo_chat_token", token);
+    localStorage.setItem("aljo_chat_user", JSON.stringify(user));
+    set({ user, token, isAuthenticated: true });
+  },
+
+  updateUser: (updatedFields) => {
+    set((state) => {
+      if (!state.user) return state;
+      const newUser = { ...state.user, ...updatedFields };
+      localStorage.setItem("aljo_chat_user", JSON.stringify(newUser));
+      return { user: newUser };
+    });
+  },
+
+  logout: () => {
+    localStorage.removeItem("aljo_chat_token");
+    localStorage.removeItem("aljo_chat_user");
+    localStorage.removeItem("aljo_chat_private_key");
+    localStorage.removeItem("aljo_chat_public_key");
+    set({ user: null, token: null, isAuthenticated: false });
+  },
+}));
