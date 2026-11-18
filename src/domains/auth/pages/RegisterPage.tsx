@@ -11,7 +11,7 @@ import { User, Mail, Lock, ArrowRight, AlertCircle, ShieldCheck } from "lucide-r
 export default function RegisterPage() {
   const router = useRouter();
   const setAuth = useAuthStore((s) => s.setAuth);
-  const initializeCrypto = useCryptoStore((s) => s.initializeCrypto);
+  const setupKeys = useCryptoStore((s) => s.setupKeys);
 
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -25,15 +25,19 @@ export default function RegisterPage() {
     setIsLoading(true);
 
     try {
-      // 1. Generate local E2EE keypair first
-      const pubKeyJwk = await initializeCrypto();
-
-      // 2. Register account with backend
+      // 1. Register account with backend
       const { user, accessToken } = await authService.register({ name, email, password });
       setAuth(user, accessToken);
 
-      // 3. Publish E2EE Public Key
-      await authService.publishPublicKey(pubKeyJwk);
+      // 2. Create the E2EE key pair and store its password-wrapped backup
+      try {
+        await setupKeys(user.id, password);
+      } catch (cryptoErr) {
+        console.error("Crypto setup error:", cryptoErr);
+        useAuthStore.getState().logout();
+        setErrorMsg("Account created, but encryption setup failed. Please sign in to finish setup.");
+        return;
+      }
 
       router.push("/chat");
     } catch (err: unknown) {

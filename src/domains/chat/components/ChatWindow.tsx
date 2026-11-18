@@ -5,7 +5,6 @@ import { useChatStore } from "@/shared/stores/chat.store";
 import { useAuthStore } from "@/shared/stores/auth.store";
 import { useCryptoStore } from "@/shared/stores/crypto.store";
 import { useSocketStore } from "@/shared/stores/socket.store";
-import { useCallStore } from "@/shared/stores/call.store";
 import { useMessages } from "@/domains/chat/hooks/useMessages";
 import { useSendMessageMutation } from "@/domains/chat/hooks/useMessageMutations";
 import {
@@ -13,8 +12,7 @@ import {
   useDeleteGroupMutation,
   useDeleteDirectMutation,
 } from "@/domains/chat/hooks/useConversationMutations";
-import { useDirectCall } from "@/domains/call/hooks/useDirectCall";
-import { useGroupCall } from "@/domains/call/hooks/useGroupCall";
+import { startCall } from "@/domains/call/services/call.controller";
 
 import { encryptE2EEMessage, decryptE2EEMessage } from "@/shared/lib/crypto";
 import {
@@ -34,21 +32,18 @@ import {
   Video,
 } from "lucide-react";
 import ManageMembersModal from "@/domains/chat/components/ManageMembersModal";
-import { IUser } from "@/domains/user";
+import { IMessage } from "@/domains/chat/types";
+
+const SEND_TIMEOUT_MS = 10_000;
 
 export default function ChatWindow() {
   const activeConversation = useChatStore((s) => s.activeConversation);
   const setActiveConversation = useChatStore((s) => s.setActiveConversation);
   const currentUser = useAuthStore((s) => s.user);
 
-  const { initializeCrypto, privateKey } = useCryptoStore();
+  const { loadKeys, privateKey, publicKeyJwk } = useCryptoStore();
   const socket = useSocketStore((s) => s.socket);
   const typingUsers = useChatStore((s) => s.typingUsers);
-
-  // Call Domain hooks & stores
-  const { status: callStatus, activeCall } = useCallStore();
-  const { initiateCall, acceptCall, rejectCall, terminateCall: terminateDirectCall } = useDirectCall();
-  const { joinGroupCall, leaveGroupCall } = useGroupCall();
 
   const { data: rawMessages = [], isLoading } = useMessages(activeConversation?.id || null);
   const sendMessageMutation = useSendMessageMutation();
@@ -62,26 +57,19 @@ export default function ChatWindow() {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [isManageMembersOpen, setIsManageMembersOpen] = useState(false);
   const [confirmAction, setConfirmAction] = useState<"leave" | "deleteGroup" | "deleteDirect" | null>(null);
+  const [sendError, setSendError] = useState<string | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isTypingRef = useRef(false);
 
-  // Initialize E2EE Crypto Engine on mount
+  // Load this user's E2EE keys (restored at login from the password-wrapped backup).
+  // Socket rooms for every conversation are joined server-side on connect, so
+  // there is nothing to join/leave here when switching conversations.
   useEffect(() => {
-    initializeCrypto().catch(console.error);
-  }, [initializeCrypto]);
-
-  // Join Socket.io conversation room when active conversation changes
-  useEffect(() => {
-    if (!socket || !activeConversation) return;
-
-    socket.emit("join_conversation", { conversationId: activeConversation.id });
-
-    return () => {
-      socket.emit("leave_conversation", { conversationId: activeConversation.id });
-    };
-  }, [socket, activeConversation]);
+    if (!currentUser) return;
+    loadKeys(currentUser.id).catch(console.error);
+  }, [currentUser, loadKeys]);
 
   // Scroll to bottom when messages update
   useEffect(() => {
@@ -95,23 +83,26 @@ export default function ChatWindow() {
     let isMounted = true;
 
     const decryptAll = async () => {
-      const partner = activeConversation.members.find((m) => m.id !== currentUser?.id);
+      const partnerMember = activeConversation.members.find((m) => m.id !== currentUser?.id);
       const newEntries: Record<string, string> = {};
       let hasNewDecryption = false;
 
       for (const msg of rawMessages) {
         if (msg.isEncrypted && msg.ciphertext && msg.iv && !decryptedMap[msg.id]) {
           try {
-            const senderPubKey =
+            // ECDH is symmetric: decrypt with *our* private key and the *other*
+            // side's public key, using the exact keys recorded when the message
+            // was sent (falls back to current keys for older messages).
+            const counterpartPubKey =
               msg.senderId === currentUser?.id
-                ? partner?.publicKey || msg.sender?.publicKey
-                : msg.sender?.publicKey || partner?.publicKey;
+                ? msg.recipientPublicKey || partnerMember?.publicKey
+                : msg.senderPublicKey || msg.sender?.publicKey;
 
-            if (senderPubKey && privateKey) {
+            if (counterpartPubKey && privateKey) {
               const plain = await decryptE2EEMessage(
                 msg.ciphertext,
                 msg.iv,
-                senderPubKey,
+                counterpartPubKey,
                 privateKey
               );
               newEntries[msg.id] = plain;
@@ -157,20 +148,11 @@ export default function ChatWindow() {
   const isAdmin = currentMemberRecord?.role === "admin" || activeConversation.createdBy === currentUser?.id;
   const activeTypers = typingUsers[activeConversation.id] || [];
 
-  const handleStartCall = (callType: "audio" | "video") => {
-    if (isDirectChat && partner) {
-      initiateCall(activeConversation, partner as unknown as IUser, callType);
-    } else {
-      joinGroupCall(activeConversation, callType, true);
-    }
-  };
+  // Direct chats are encrypted when both sides have published a key.
+  const canEncrypt = isDirectChat && !!partner?.publicKey;
 
-  const handleEndCall = () => {
-    if (activeCall?.mode === "group") {
-      leaveGroupCall(activeConversation.id);
-    } else {
-      terminateDirectCall();
-    }
+  const handleStartCall = (callType: "audio" | "video") => {
+    void startCall(activeConversation, callType);
   };
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -201,51 +183,64 @@ export default function ChatWindow() {
     if (!inputText.trim() && !selectedFile) return;
 
     const messageText = inputText.trim();
-    setInputText("");
     const fileToSend = selectedFile;
-    setSelectedFile(null);
+    setSendError(null);
 
     try {
-      let isEncrypted = false;
-      let ciphertext: string | undefined;
-      let iv: string | undefined;
+      let encryption: {
+        isEncrypted: boolean;
+        ciphertext?: string;
+        iv?: string;
+        senderPublicKey?: string;
+        recipientPublicKey?: string;
+      } = { isEncrypted: false };
 
-      if (isDirectChat && partner?.publicKey && privateKey && messageText) {
-        const encrypted = await encryptE2EEMessage(messageText, partner.publicKey, privateKey);
-        isEncrypted = true;
-        ciphertext = encrypted.ciphertext;
-        iv = encrypted.iv;
+      if (canEncrypt && messageText) {
+        if (!privateKey || !publicKeyJwk) {
+          // Never silently fall back to plaintext in an encrypted chat.
+          setSendError("Your encryption keys are not available on this device. Please sign in again.");
+          return;
+        }
+        const encrypted = await encryptE2EEMessage(messageText, partner!.publicKey!, privateKey);
+        encryption = {
+          isEncrypted: true,
+          ciphertext: encrypted.ciphertext,
+          iv: encrypted.iv,
+          senderPublicKey: publicKeyJwk,
+          recipientPublicKey: partner!.publicKey!,
+        };
       }
 
-      const msgType: "text" | "image" | "file" | "audio" = fileToSend
-        ? fileToSend.type.startsWith("image/")
-          ? "image"
-          : "file"
-        : "text";
+      setInputText("");
+      setSelectedFile(null);
 
-      const payload = {
-        conversationId: activeConversation.id,
-        content: isEncrypted ? undefined : messageText,
-        file: fileToSend || undefined,
-        type: msgType,
-        isEncrypted,
-        ciphertext,
-        iv,
-      };
+      // Plaintext is only ever sent for unencrypted messages.
+      const content = encryption.isEncrypted ? undefined : messageText || undefined;
 
-      if (socket && !fileToSend) {
-        socket.emit("send_message", {
+      if (fileToSend) {
+        await sendMessageMutation.mutateAsync({
           conversationId: activeConversation.id,
-          content: messageText,
-          isEncrypted,
-          ciphertext,
-          iv,
+          content,
+          file: fileToSend,
+          type: fileToSend.type.startsWith("image/") ? "image" : "file",
+          ...encryption,
         });
       } else {
-        await sendMessageMutation.mutateAsync(payload);
+        if (!socket?.connected) throw new Error("You are offline");
+        const res = (await socket
+          .timeout(SEND_TIMEOUT_MS)
+          .emitWithAck("send_message", { conversationId: activeConversation.id, content, ...encryption })) as {
+          error?: string;
+          message?: IMessage;
+        };
+        if (res.error) throw new Error(res.error);
       }
     } catch (err) {
       console.error("Failed to send message", err);
+      // Give the text back so nothing is lost.
+      setInputText((current) => current || messageText);
+      setSelectedFile((current) => current || fileToSend);
+      setSendError("Message not sent. Please try again.");
     }
   };
 
@@ -269,8 +264,6 @@ export default function ChatWindow() {
     }
   };
 
-  const isCallActive = (callStatus === "connected" || callStatus === "calling") && activeCall;
-
   return (
     <div className="flex-1 h-full glass-panel flex flex-col bg-slate-950/40 relative overflow-hidden">
       {/* Header */}
@@ -284,11 +277,19 @@ export default function ChatWindow() {
               <h2 className="text-sm font-bold text-white">
                 {isDirectChat ? partner?.name : activeConversation.title || "Group Chat"}
               </h2>
-              {isDirectChat && (
-                <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
-                  <ShieldCheck className="w-3 h-3" /> E2EE Encrypted
-                </span>
-              )}
+              {isDirectChat &&
+                (canEncrypt ? (
+                  <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+                    <ShieldCheck className="w-3 h-3" /> E2EE Encrypted
+                  </span>
+                ) : (
+                  <span
+                    title="This contact has not set up encryption yet. Messages are not end-to-end encrypted."
+                    className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30"
+                  >
+                    Not encrypted
+                  </span>
+                ))}
             </div>
 
             <p className="text-xs text-gray-400">
@@ -517,6 +518,12 @@ export default function ChatWindow() {
               >
                 Remove
               </button>
+            </div>
+          )}
+
+          {sendError && (
+            <div role="alert" className="px-4 py-2 bg-rose-500/10 border-t border-rose-500/30 text-xs text-rose-300">
+              {sendError}
             </div>
           )}
 

@@ -18,12 +18,16 @@ export const useSocketStore = create<SocketState>((set, get) => ({
   onlineUsers: {},
 
   connectSocket: (token) => {
-    if (get().socket?.connected) return;
+    // A socket that is connected or still reconnecting is reused; never run two at once.
+    const existing = get().socket;
+    if (existing?.active) return;
+    existing?.disconnect();
 
     const newSocket = io(SOCKET_URL, {
       auth: { token },
       transports: ["websocket", "polling"],
-      reconnectionAttempts: 5,
+      // Keep retrying (with backoff) instead of giving up after a few attempts.
+      reconnectionDelayMax: 10_000,
     });
 
     newSocket.on("connect", () => {

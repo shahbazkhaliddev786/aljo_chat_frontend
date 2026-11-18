@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { IUser } from "@/domains/user/types";
+import { useCryptoStore } from "@/shared/stores/crypto.store";
 
 interface AuthState {
   user: IUser | null;
@@ -33,8 +34,8 @@ export const useAuthStore = create<AuthState>((set) => ({
   logout: () => {
     localStorage.removeItem("aljo_chat_token");
     localStorage.removeItem("aljo_chat_user");
-    localStorage.removeItem("aljo_chat_private_key");
-    localStorage.removeItem("aljo_chat_public_key");
+    // Keys are restored from the password-wrapped server backup on next login.
+    useCryptoStore.getState().reset();
     set({ user: null, token: null, isAuthenticated: false });
   },
 }));

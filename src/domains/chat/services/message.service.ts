@@ -15,9 +15,12 @@ export const messageService = {
     isEncrypted?: boolean;
     ciphertext?: string;
     iv?: string;
+    senderPublicKey?: string;
+    recipientPublicKey?: string;
     replyToId?: string;
   }): Promise<IMessage> => {
-    const { conversationId, content, file, type, isEncrypted, ciphertext, iv, replyToId } = params;
+    const { conversationId, content, file, type, isEncrypted, ciphertext, iv, senderPublicKey, recipientPublicKey, replyToId } =
+      params;
 
     if (file) {
       const formData = new FormData();
@@ -28,6 +31,8 @@ export const messageService = {
       if (isEncrypted) formData.append("isEncrypted", "true");
       if (ciphertext) formData.append("ciphertext", ciphertext);
       if (iv) formData.append("iv", iv);
+      if (senderPublicKey) formData.append("senderPublicKey", senderPublicKey);
+      if (recipientPublicKey) formData.append("recipientPublicKey", recipientPublicKey);
 
       const res = await api.post(`/messages/${conversationId}`, formData, {
         headers: { "Content-Type": "multipart/form-data" },
@@ -41,6 +46,8 @@ export const messageService = {
       isEncrypted,
       ciphertext,
       iv,
+      senderPublicKey,
+      recipientPublicKey,
       replyToId,
     });
     return res.data.data.message;

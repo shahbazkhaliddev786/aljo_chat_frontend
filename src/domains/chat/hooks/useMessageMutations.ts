@@ -18,15 +18,17 @@ export function useSendMessageMutation() {
       isEncrypted?: boolean;
       ciphertext?: string;
       iv?: string;
+      senderPublicKey?: string;
+      recipientPublicKey?: string;
       replyToId?: string;
     }
   >({
     mutationFn: (params) => messageService.sendMessage(params),
     onSuccess: (newMessage) => {
-      queryClient.setQueryData<IMessage[]>(["messages", newMessage.conversationId], (old = []) => [
-        ...old,
-        newMessage,
-      ]);
+      // The same message also arrives over the socket; only add it once.
+      queryClient.setQueryData<IMessage[]>(["messages", newMessage.conversationId], (old = []) =>
+        old.some((m) => m.id === newMessage.id) ? old : [...old, newMessage]
+      );
       queryClient.invalidateQueries({ queryKey: ["conversations"] });
     },
   });

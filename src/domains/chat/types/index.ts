@@ -20,6 +20,9 @@ export interface IMessage {
   isEncrypted: boolean;
   ciphertext?: string | null;
   iv?: string | null;
+  /** Public keys used to derive this message's key (E2EE). */
+  senderPublicKey?: string | null;
+  recipientPublicKey?: string | null;
   isEdited: boolean;
   isDeleted: boolean;
   createdAt: string;

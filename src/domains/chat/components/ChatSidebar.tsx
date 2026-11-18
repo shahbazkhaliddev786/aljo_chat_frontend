@@ -1,6 +1,9 @@
 "use client";
 
 import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { hangUp } from "@/domains/call/services/call.controller";
+import { useCallStore } from "@/shared/stores/call.store";
 import { useConversations } from "@/domains/chat/hooks/useConversations";
 import { useUserSearch } from "@/domains/user/hooks/useUserSearch";
 import { useCreateDirectConversationMutation } from "@/domains/chat/hooks/useConversationMutations";
@@ -19,6 +22,14 @@ export default function ChatSidebar() {
 
   const currentUser = useAuthStore((s) => s.user);
   const logout = useAuthStore((s) => s.logout);
+  const queryClient = useQueryClient();
+
+  const handleLogout = () => {
+    if (useCallStore.getState().status !== "idle") hangUp();
+    // Drop cached conversations/messages so the next account never sees them.
+    queryClient.clear();
+    logout();
+  };
   const onlineUsers = useSocketStore((s) => s.onlineUsers);
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -75,7 +86,7 @@ export default function ChatSidebar() {
             <Users className="w-5 h-5 text-indigo-400" />
           </button>
           <button
-            onClick={logout}
+            onClick={handleLogout}
             title="Logout"
             className="p-2 rounded-xl text-gray-400 hover:text-rose-400 hover:bg-rose-500/10 transition"
           >
@@ -198,8 +209,14 @@ export default function ChatSidebar() {
                     )}
                   </div>
                   <p className="text-[11px] text-gray-400 truncate mt-0.5">
-                    {conv.latestMessage?.content ||
-                      (conv.latestMessage?.type === "image" ? "📷 Image" : "No messages yet")}
+                    {conv.latestMessage
+                      ? conv.latestMessage.content ||
+                        (conv.latestMessage.type === "image"
+                          ? "📷 Image"
+                          : conv.latestMessage.type === "file"
+                            ? "📎 File"
+                            : "🔒 Encrypted message")
+                      : "No messages yet"}
                   </p>
                 </div>
               </button>

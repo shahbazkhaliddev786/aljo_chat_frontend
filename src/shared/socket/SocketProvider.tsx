@@ -4,7 +4,6 @@ import { useEffect } from "react";
 import { useAuthStore } from "@/shared/stores/auth.store";
 import { useSocketStore } from "@/shared/stores/socket.store";
 import { useChatStore } from "@/shared/stores/chat.store";
-import { useCallStore } from "@/shared/stores/call.store";
 import { useQueryClient } from "@tanstack/react-query";
 import { IMessage } from "@/domains/chat/types";
 
@@ -17,8 +16,6 @@ export default function SocketProvider({ children }: { children: React.ReactNode
   const removeTypingUser = useChatStore((s) => s.removeTypingUser);
   const setActiveConversation = useChatStore((s) => s.setActiveConversation);
   const activeConversationId = useChatStore((s) => s.activeConversationId);
-  const setIncomingCall = useCallStore((s) => s.setIncomingCall);
-  const endCall = useCallStore((s) => s.endCall);
   const queryClient = useQueryClient();
 
   useEffect(() => {
@@ -80,57 +77,7 @@ export default function SocketProvider({ children }: { children: React.ReactNode
       removeTypingUser(conversationId, userName);
     };
 
-    const handleIncomingCall = (data: {
-      callerUserId: string;
-      callerName: string;
-      callerAvatar?: string | null;
-      callerSocketId: string;
-      conversationId: string;
-      callType: "audio" | "video";
-    }) => {
-      setIncomingCall({
-        conversationId: data.conversationId,
-        targetUserId: data.callerUserId,
-        targetUserName: data.callerName,
-        targetUserAvatar: data.callerAvatar,
-        callType: data.callType,
-        mode: "direct",
-        callerSocketId: data.callerSocketId,
-      });
-    };
-
-    const handleCallEnded = () => {
-      endCall();
-    };
-
-    const handleGroupCallStarted = (data: {
-      conversationId: string;
-      callType: "audio" | "video";
-      callerUserId: string;
-      callerName: string;
-      callerAvatar?: string | null;
-    }) => {
-      // Don't show notification if already in a call
-      const currentStatus = useCallStore.getState().status;
-      if (currentStatus !== "idle") return;
-
-      setIncomingCall({
-        conversationId: data.conversationId,
-        targetUserId: data.callerUserId,
-        targetUserName: data.callerName,
-        targetUserAvatar: data.callerAvatar,
-        callType: data.callType,
-        mode: "group",
-      });
-    };
-
-    const handleGroupCallEnded = ({ conversationId }: { conversationId: string }) => {
-      const state = useCallStore.getState();
-      // Only dismiss if we're showing an incoming notification for this conversation
-      if (state.status === "incoming" && state.activeCall?.conversationId === conversationId) {
-        endCall();
-      }
-    };
+    // Call events are handled by the call controller (see CallProvider).
 
     socket.on("receive_message", handleReceiveMessage);
     socket.on("group_deleted", handleConversationDeleted);
@@ -140,10 +87,6 @@ export default function SocketProvider({ children }: { children: React.ReactNode
     socket.on("member_removed_from_group", handleMemberRemovedFromGroup);
     socket.on("typing_start", handleTypingStart);
     socket.on("typing_stop", handleTypingStop);
-    socket.on("call:incoming", handleIncomingCall);
-    socket.on("call:ended", handleCallEnded);
-    socket.on("group:call:started", handleGroupCallStarted);
-    socket.on("group:call:ended", handleGroupCallEnded);
 
     return () => {
       socket.off("receive_message", handleReceiveMessage);
@@ -154,10 +97,6 @@ export default function SocketProvider({ children }: { children: React.ReactNode
       socket.off("member_removed_from_group", handleMemberRemovedFromGroup);
       socket.off("typing_start", handleTypingStart);
       socket.off("typing_stop", handleTypingStop);
-      socket.off("call:incoming", handleIncomingCall);
-      socket.off("call:ended", handleCallEnded);
-      socket.off("group:call:started", handleGroupCallStarted);
-      socket.off("group:call:ended", handleGroupCallEnded);
     };
   }, [
     socket,
@@ -167,8 +106,6 @@ export default function SocketProvider({ children }: { children: React.ReactNode
     setActiveConversation,
     activeConversationId,
     currentUser,
-    setIncomingCall,
-    endCall,
   ]);
 
   return <>{children}</>;
