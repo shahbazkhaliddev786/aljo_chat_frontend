@@ -41,9 +41,29 @@ export function setOptimisticStatus(
   );
 }
 
-/** Keep unconfirmed local messages when the list is refetched from the server. */
+export const messagesMetaKey = (conversationId: string) => ["messages-meta", conversationId];
+
+/**
+ * Merge the latest page from the server with what is already cached: keep older
+ * pages the user already loaded, and keep unconfirmed local messages.
+ */
 export function mergeWithLocalMessages(server: IMessage[], previous: IMessage[] | undefined): IMessage[] {
+  const prev = previous ?? [];
+  const serverIds = new Set(server.map((m) => m.id));
   const confirmed = new Set(server.map((m) => m.clientMessageId).filter(Boolean));
-  const local = (previous ?? []).filter((m) => m.localStatus && !confirmed.has(m.clientMessageId));
-  return local.length ? [...server, ...local] : server;
+  const oldestServer = server[0]?.createdAt;
+
+  const olderLoaded = oldestServer
+    ? prev.filter((m) => !m.localStatus && !serverIds.has(m.id) && m.createdAt < oldestServer)
+    : [];
+  const local = prev.filter((m) => m.localStatus && !confirmed.has(m.clientMessageId));
+  return [...olderLoaded, ...server, ...local];
+}
+
+/** Add an older page in front of the cached messages. */
+export function prependOlderMessages(queryClient: QueryClient, conversationId: string, older: IMessage[]) {
+  queryClient.setQueryData<IMessage[]>(messagesKey(conversationId), (old = []) => {
+    const known = new Set(old.map((m) => m.id));
+    return [...older.filter((m) => !known.has(m.id)), ...old];
+  });
 }

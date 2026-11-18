@@ -4,6 +4,8 @@ import { useEffect, useRef } from "react";
 import { useCallStore, RemoteParticipant } from "@/shared/stores/call.store";
 import { useCallTimer } from "@/domains/call/hooks/useCallTimer";
 import CallToolbar from "./CallToolbar";
+import { MicOff, VideoOff } from "lucide-react";
+import { useAuthStore } from "@/shared/stores/auth.store";
 
 interface VideoGridProps {
   onEndCall: () => void;
@@ -14,11 +16,15 @@ function VideoTile({
   name,
   isLocal = false,
   isSpeaking = false,
+  isAudioMuted = false,
+  isVideoMuted = false,
 }: {
   stream?: MediaStream | null;
   name: string;
   isLocal?: boolean;
   isSpeaking?: boolean;
+  isAudioMuted?: boolean;
+  isVideoMuted?: boolean;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
@@ -42,12 +48,29 @@ function VideoTile({
         autoPlay
         playsInline
         muted={isLocal}
-        className={`w-full h-full object-cover ${isLocal ? "scale-x-[-1]" : ""}`}
+        className={`w-full h-full object-cover ${isLocal ? "scale-x-[-1]" : ""} ${isVideoMuted ? "invisible" : ""}`}
       />
+
+      {/* Camera off: show an avatar instead of a frozen/black frame */}
+      {isVideoMuted && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-slate-900">
+          <div className="w-16 h-16 rounded-full bg-slate-800 border border-white/10 flex items-center justify-center text-2xl font-bold text-indigo-300">
+            {name.charAt(0).toUpperCase()}
+          </div>
+          <span className="inline-flex items-center gap-1 text-[11px] text-gray-400">
+            <VideoOff className="w-3.5 h-3.5" /> Camera off
+          </span>
+        </div>
+      )}
 
       <div className="absolute bottom-3 left-3 px-3 py-1 bg-black/60 backdrop-blur-md rounded-xl border border-white/10 text-xs font-semibold text-white flex items-center gap-1.5 z-10">
         <span>{name}</span>
         {isLocal && <span className="text-[10px] text-indigo-400">(You)</span>}
+        {isAudioMuted && (
+          <span role="img" aria-label="Microphone muted" title="Microphone muted">
+            <MicOff className="w-3.5 h-3.5 text-rose-400" />
+          </span>
+        )}
       </div>
     </div>
   );
@@ -56,6 +79,9 @@ function VideoTile({
 export default function VideoGrid({ onEndCall }: VideoGridProps) {
   const { localStream, remoteStreams, activeCall, status } = useCallStore();
   const callStartTimeSet = useCallStore((s) => s.callStartTime !== null);
+  const isMicMuted = useCallStore((s) => s.isMicMuted);
+  const isCameraOff = useCallStore((s) => s.isCameraOff);
+  const myName = useAuthStore((s) => s.user?.name) || "You";
   const { formattedDuration } = useCallTimer();
 
   const participants: RemoteParticipant[] = Object.values(remoteStreams);
@@ -99,8 +125,10 @@ export default function VideoGrid({ onEndCall }: VideoGridProps) {
         {/* Local User Stream */}
         <VideoTile
           stream={localStream}
-          name="You"
+          name={myName}
           isLocal={true}
+          isAudioMuted={isMicMuted}
+          isVideoMuted={isCameraOff}
         />
 
         {/* Remote Participants Streams */}
@@ -110,6 +138,8 @@ export default function VideoGrid({ onEndCall }: VideoGridProps) {
             stream={p.stream}
             name={p.userName}
             isSpeaking={p.isSpeaking}
+            isAudioMuted={p.isAudioMuted}
+            isVideoMuted={p.isVideoMuted}
           />
         ))}
       </div>

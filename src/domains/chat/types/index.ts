@@ -7,6 +7,8 @@ export interface IConversationMember {
   role: "admin" | "member";
   status: "online" | "offline" | "away";
   lastSeen?: string | null;
+  /** The newest message this member has read (read receipts). */
+  lastReadMessageId?: string | null;
 }
 
 export interface IMessage {
@@ -61,6 +63,7 @@ export interface IConversation {
     id: string;
     content?: string | null;
     type: string;
+    isEncrypted?: boolean;
     senderId: string;
     createdAt: string;
   } | null;

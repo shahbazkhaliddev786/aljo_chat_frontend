@@ -51,6 +51,16 @@ let isAccepting = false;
 let connectTimer: ReturnType<typeof setTimeout> | null = null;
 let disconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let iceRestartAttempted = false;
+/** Mic/camera state of remote participants, by socket id ("peer" for 1-on-1). */
+const remoteMediaStates = new Map<string, { audio: boolean; video: boolean }>();
+
+function applyRemoteMediaState(socketId: string, state?: { audio: boolean; video: boolean }) {
+  if (state) remoteMediaStates.set(socketId, state);
+  const current = remoteMediaStates.get(socketId);
+  if (current) {
+    store().updateRemoteParticipant(socketId, { isAudioMuted: !current.audio, isVideoMuted: !current.video });
+  }
+}
 let noticeTimer: ReturnType<typeof setTimeout> | null = null;
 
 const store = () => useCallStore.getState();
@@ -115,7 +125,34 @@ function beginConnecting(timeoutMs = CONNECT_TIMEOUT_MS, failureNotice = "Could 
 /** Media is flowing. */
 function markConnected() {
   clearConnectTimers();
+  const wasConnected = store().status === "connected";
   store().setCallConnected();
+  // Let the other side know if we joined muted / with the camera off.
+  if (!wasConnected) sendMediaState();
+}
+
+function sendMediaState() {
+  const { activeCall, isMicMuted, isCameraOff } = store();
+  const state = { audio: !isMicMuted, video: !isCameraOff };
+  if (activeCall?.mode === "direct" && activeCall.callId) {
+    getSocket()?.emit("call:media-state", { callId: activeCall.callId, ...state });
+  } else if (activeCall?.mode === "group") {
+    sfu?.sendMediaState(state);
+  }
+}
+
+/** Mute/unmute the microphone and tell the other participants. */
+export function toggleMic() {
+  store().toggleMic();
+  sfu?.setPaused("audio", store().isMicMuted);
+  sendMediaState();
+}
+
+/** Turn the camera off/on and tell the other participants. */
+export function toggleCamera() {
+  store().toggleCamera();
+  sfu?.setPaused("video", store().isCameraOff);
+  sendMediaState();
 }
 
 /** Release every media object of the current call and reset the store. */
@@ -127,6 +164,7 @@ function teardown(notice?: string) {
   groupSession++;
   isAccepting = false;
   pendingProducerIds = [];
+  remoteMediaStates.clear();
 
   p2p?.close();
   p2p = null;
@@ -230,7 +268,9 @@ function createP2P(callId: string, iceServers: RTCIceServer[], peer: RemotePeer)
       else socket.emit(signal.type === "offer" ? "call:offer" : "call:answer", { callId, sdp: signal.sdp });
     },
     onRemoteStream: (stream) => {
-      if (p2p === service) store().setRemoteStream({ socketId: "peer", ...peer }, stream);
+      if (p2p !== service) return;
+      store().setRemoteStream({ socketId: "peer", ...peer }, stream);
+      applyRemoteMediaState("peer");
     },
     onConnectionStateChange: (state) => {
       if (p2p === service) handleP2PConnectionState(service, state);
@@ -431,6 +471,7 @@ async function consumeRemote(service: MediasoupSFUService, producerId: string) {
       { socketId: consumed.socketId, userId: consumed.userId, userName: consumed.userName },
       consumed.track
     );
+    applyRemoteMediaState(consumed.socketId);
     markConnected();
   } catch (err) {
     console.error("Failed to consume producer", producerId, err);
@@ -491,8 +532,9 @@ async function joinGroupCall(conversation: IConversation, callType: CallType, is
       }, GROUP_RING_TIMEOUT_MS);
     }
 
-    const existing = await service.getExistingProducers();
+    const { producers: existing, peers } = await service.getExisting();
     if (sfu !== service) return;
+    peers.forEach((p) => remoteMediaStates.set(p.socketId, { audio: p.audio, video: p.video }));
 
     if (!isInitiator && existing.length === 0) {
       return teardown("This call has already ended");
@@ -522,6 +564,25 @@ function handleUserLeft({ conversationId, socketId }: { conversationId: string; 
   if (call?.mode !== "group" || call.conversationId !== conversationId) return;
   sfu?.removeParticipant(socketId);
   store().removeRemoteParticipant(socketId);
+}
+
+function handleDirectMediaState({ callId, audio, video }: { callId: string; audio: boolean; video: boolean }) {
+  if (isCurrentDirectCall(callId)) applyRemoteMediaState("peer", { audio, video });
+}
+
+function handleGroupMediaState({
+  conversationId,
+  socketId,
+  audio,
+  video,
+}: {
+  conversationId: string;
+  socketId: string;
+  audio: boolean;
+  video: boolean;
+}) {
+  const call = store().activeCall;
+  if (call?.mode === "group" && call.conversationId === conversationId) applyRemoteMediaState(socketId, { audio, video });
 }
 
 function handleGroupCallStarted(data: {
@@ -580,6 +641,8 @@ export function attachCallHandlers(socket: Socket): () => void {
     ["call:offer", handleOffer],
     ["call:answer", handleAnswer],
     ["ice:candidate", handleIceCandidate],
+    ["call:media-state", handleDirectMediaState],
+    ["sfu:media-state", handleGroupMediaState],
     ["sfu:new-producer", handleNewProducer],
     ["sfu:user-left", handleUserLeft],
     ["group:call:started", handleGroupCallStarted],

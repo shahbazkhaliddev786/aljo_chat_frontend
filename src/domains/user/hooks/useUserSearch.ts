@@ -8,6 +8,7 @@ export function useUserSearch(query: string) {
   return useQuery<IUser[]>({
     queryKey: ["users", "search", query],
     queryFn: () => userService.searchUsers(query),
-    enabled: query.trim().length > 0,
+    // The server ignores queries shorter than 2 characters.
+    enabled: query.trim().length >= 2,
   });
 }

@@ -24,8 +24,8 @@ export default function LoginPage() {
     setIsLoading(true);
 
     try {
-      const { user, accessToken } = await authService.login({ email, password });
-      setAuth(user, accessToken);
+      const { user, accessToken, refreshToken } = await authService.login({ email, password });
+      setAuth(user, accessToken, refreshToken);
 
       // Restore (or create) this account's E2EE key pair. Without it, encrypted
       // chats cannot be read, so a failure here is surfaced instead of ignored.

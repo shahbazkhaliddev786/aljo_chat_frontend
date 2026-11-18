@@ -26,8 +26,8 @@ export default function RegisterPage() {
 
     try {
       // 1. Register account with backend
-      const { user, accessToken } = await authService.register({ name, email, password });
-      setAuth(user, accessToken);
+      const { user, accessToken, refreshToken } = await authService.register({ name, email, password });
+      setAuth(user, accessToken, refreshToken);
 
       // 2. Create the E2EE key pair and store its password-wrapped backup
       try {
@@ -113,6 +113,7 @@ export default function RegisterPage() {
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 className="w-full pl-10 pr-4 py-2.5 rounded-xl glass-input text-xs"
+                minLength={8}
                 required
               />
             </div>

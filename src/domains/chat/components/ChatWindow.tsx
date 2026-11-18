@@ -1,11 +1,11 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useRef } from "react";
 import { useChatStore } from "@/shared/stores/chat.store";
 import { useAuthStore } from "@/shared/stores/auth.store";
 import { useCryptoStore } from "@/shared/stores/crypto.store";
 import { useSocketStore } from "@/shared/stores/socket.store";
-import { useMessages } from "@/domains/chat/hooks/useMessages";
+import { useMessages, useOlderMessages } from "@/domains/chat/hooks/useMessages";
 import { useConversations } from "@/domains/chat/hooks/useConversations";
 import { useSendMessage, OutgoingPayload } from "@/domains/chat/hooks/useSendMessage";
 import {
@@ -21,6 +21,7 @@ import {
   Send,
   Image as ImageIcon,
   Check,
+  CheckCheck,
   Clock,
   AlertCircle,
   Users,
@@ -51,6 +52,7 @@ export default function ChatWindow() {
   const typingUsers = useChatStore((s) => s.typingUsers);
 
   const { data: rawMessages = [], isLoading } = useMessages(activeConversation?.id || null);
+  const { hasMore, isLoading: isLoadingOlder, loadOlder } = useOlderMessages(activeConversation?.id || null);
   const { send, retry, discard } = useSendMessage();
   const leaveGroupMutation = useLeaveGroupMutation();
   const deleteGroupMutation = useDeleteGroupMutation();
@@ -65,6 +67,9 @@ export default function ChatWindow() {
   const [sendError, setSendError] = useState<string | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  // Scroll height before an older page is prepended, to keep the view in place.
+  const prependAnchorRef = useRef<number | null>(null);
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isTypingRef = useRef(false);
 
@@ -76,10 +81,43 @@ export default function ChatWindow() {
     loadKeys(currentUser.id).catch(console.error);
   }, [currentUser, loadKeys]);
 
-  // Scroll to bottom when messages update
+  // Scroll to the bottom only when a *new* message arrives at the end (not when
+  // older history is loaded at the top).
+  const newestMessageId = rawMessages[rawMessages.length - 1]?.id;
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [rawMessages, decryptedMap]);
+  }, [newestMessageId, activeConversation?.id]);
+
+  // After older messages are prepended, keep the same messages on screen.
+  useLayoutEffect(() => {
+    const container = scrollContainerRef.current;
+    if (container && prependAnchorRef.current !== null) {
+      container.scrollTop += container.scrollHeight - prependAnchorRef.current;
+      prependAnchorRef.current = null;
+    }
+  }, [rawMessages.length]);
+
+  // Read receipts: while this chat is on screen, mark the newest incoming message as read.
+  const newestIncoming = [...rawMessages].reverse().find((m) => !m.localStatus && m.senderId !== currentUser?.id);
+  const myLastRead = activeConversation?.members.find((m) => m.id === currentUser?.id)?.lastReadMessageId;
+  const lastReadSentRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!socket || !activeConversation || !newestIncoming) return;
+    const markRead = () => {
+      if (document.visibilityState !== "visible") return;
+      if (newestIncoming.id === myLastRead || newestIncoming.id === lastReadSentRef.current) return;
+      lastReadSentRef.current = newestIncoming.id;
+      socket.emit("message_read", { conversationId: activeConversation.id, messageId: newestIncoming.id });
+    };
+    markRead();
+    document.addEventListener("visibilitychange", markRead);
+    return () => document.removeEventListener("visibilitychange", markRead);
+  }, [socket, activeConversation, newestIncoming, myLastRead]);
+
+  const handleLoadOlder = () => {
+    prependAnchorRef.current = scrollContainerRef.current?.scrollHeight ?? null;
+    void loadOlder();
+  };
 
   // Decrypt incoming E2EE messages in real-time
   useEffect(() => {
@@ -152,6 +190,13 @@ export default function ChatWindow() {
   const currentMemberRecord = activeConversation.members.find((m) => m.id === currentUser?.id);
   const isAdmin = currentMemberRecord?.role === "admin" || activeConversation.createdBy === currentUser?.id;
   const activeTypers = typingUsers[activeConversation.id] || [];
+
+  // For each other member, the index of the newest message they have read.
+  // A read marker that is not in the loaded window points to older history.
+  const messageIndex = new Map(rawMessages.map((m, i) => [m.id, i]));
+  const otherMembers = activeConversation.members.filter((m) => m.id !== currentUser?.id);
+  const readIndexes = otherMembers.map((m) => (m.lastReadMessageId ? (messageIndex.get(m.lastReadMessageId) ?? -1) : -1));
+  const readCountAt = (index: number) => readIndexes.filter((r) => r >= index).length;
 
   // Direct chats are encrypted when both sides have published a key.
   const canEncrypt = isDirectChat && !!partner?.publicKey;
@@ -416,7 +461,19 @@ export default function ChatWindow() {
           )}
 
           {/* Messages Feed */}
-          <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-4 space-y-4">
+            {!isLoading && hasMore && (
+              <div className="flex justify-center">
+                <button
+                  type="button"
+                  onClick={handleLoadOlder}
+                  disabled={isLoadingOlder}
+                  className="text-[11px] px-3 py-1.5 rounded-full bg-slate-800 text-gray-300 hover:bg-slate-700 disabled:opacity-60"
+                >
+                  {isLoadingOlder ? "Loading…" : "Load earlier messages"}
+                </button>
+              </div>
+            )}
             {isLoading ? (
               <div className="text-center text-xs text-gray-500 py-10">Loading message history...</div>
             ) : rawMessages.length === 0 ? (
@@ -424,7 +481,7 @@ export default function ChatWindow() {
                 No messages yet. Send a message to start chatting!
               </div>
             ) : (
-              rawMessages.map((msg) => {
+              rawMessages.map((msg, index) => {
                 const isMe = msg.senderId === currentUser?.id;
                 const displayContent = msg.localStatus
                   ? msg.localPlaintext || (msg.localFileName ? `📎 ${msg.localFileName}` : "")
@@ -515,9 +572,28 @@ export default function ChatWindow() {
                             </button>
                           </span>
                         )}
-                        {isMe && !msg.localStatus && (
-                          <Check className="w-3.5 h-3.5 text-indigo-400" aria-label="Sent" />
-                        )}
+                        {isMe &&
+                          !msg.localStatus &&
+                          (() => {
+                            const readers = readCountAt(index);
+                            const readByAll = otherMembers.length > 0 && readers === otherMembers.length;
+                            const label = readByAll
+                              ? isDirectChat
+                                ? "Read"
+                                : "Read by everyone"
+                              : !isDirectChat && readers > 0
+                                ? `Read by ${readers} of ${otherMembers.length}`
+                                : "Sent";
+                            return (
+                              <span role="img" aria-label={label} title={label}>
+                                {readByAll ? (
+                                  <CheckCheck className="w-3.5 h-3.5 text-sky-400" />
+                                ) : (
+                                  <Check className="w-3.5 h-3.5 text-indigo-400" />
+                                )}
+                              </span>
+                            );
+                          })()}
                       </div>
                     </div>
                   </div>

@@ -5,7 +5,7 @@ import { useAuthStore } from "@/shared/stores/auth.store";
 import { useSocketStore } from "@/shared/stores/socket.store";
 import { useChatStore } from "@/shared/stores/chat.store";
 import { useQueryClient } from "@tanstack/react-query";
-import { IMessage } from "@/domains/chat/types";
+import { IMessage, IConversation } from "@/domains/chat/types";
 import { upsertMessage } from "@/domains/chat/utils/message-cache";
 
 // A typing indicator disappears on its own if the "stop" event never arrives
@@ -26,7 +26,7 @@ export default function SocketProvider({ children }: { children: React.ReactNode
 
   useEffect(() => {
     if (isAuthenticated && token) {
-      connectSocket(token);
+      connectSocket();
     } else {
       disconnectSocket();
     }
@@ -44,6 +44,28 @@ export default function SocketProvider({ children }: { children: React.ReactNode
     const handleConnect = () => {
       queryClient.invalidateQueries({ queryKey: ["conversations"] });
       queryClient.invalidateQueries({ queryKey: ["messages"] });
+    };
+
+    // Someone read messages: move their read marker in the cached conversation.
+    const handleMessageRead = ({
+      conversationId,
+      userId,
+      messageId,
+    }: {
+      conversationId: string;
+      userId: string;
+      messageId: string;
+    }) => {
+      queryClient.setQueryData<IConversation[]>(["conversations"], (old) =>
+        old?.map((c) =>
+          c.id !== conversationId
+            ? c
+            : {
+                ...c,
+                members: c.members.map((m) => (m.id === userId ? { ...m, lastReadMessageId: messageId } : m)),
+              }
+        )
+      );
     };
 
     // A contact published (or changed) their encryption key.
@@ -111,6 +133,7 @@ export default function SocketProvider({ children }: { children: React.ReactNode
     // Call events are handled by the call controller (see CallProvider).
 
     socket.on("connect", handleConnect);
+    socket.on("message_read", handleMessageRead);
     socket.on("user_key_updated", handleUserKeyUpdated);
     socket.on("receive_message", handleReceiveMessage);
     socket.on("group_deleted", handleConversationDeleted);
@@ -123,6 +146,7 @@ export default function SocketProvider({ children }: { children: React.ReactNode
 
     return () => {
       socket.off("connect", handleConnect);
+      socket.off("message_read", handleMessageRead);
       socket.off("user_key_updated", handleUserKeyUpdated);
       socket.off("receive_message", handleReceiveMessage);
       socket.off("group_deleted", handleConversationDeleted);

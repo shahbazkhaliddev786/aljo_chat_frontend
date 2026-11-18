@@ -10,6 +10,14 @@ export interface RemoteProducerInfo {
   userName: string;
 }
 
+export interface RemotePeerState {
+  socketId: string;
+  userId: string;
+  userName: string;
+  audio: boolean;
+  video: boolean;
+}
+
 export interface ConsumedTrack {
   consumer: types.Consumer;
   track: MediaStreamTrack;
@@ -116,10 +124,25 @@ export class MediasoupSFUService {
     }
   }
 
-  /** Producers of the other participants already in the call. */
-  public async getExistingProducers(): Promise<RemoteProducerInfo[]> {
-    const { producers } = await this.request<{ producers: RemoteProducerInfo[] }>("sfu:get-producers");
-    return producers;
+  /** Producers and mic/camera state of the other participants already in the call. */
+  public async getExisting(): Promise<{ producers: RemoteProducerInfo[]; peers: RemotePeerState[] }> {
+    const { producers, peers } = await this.request<{ producers: RemoteProducerInfo[]; peers?: RemotePeerState[] }>(
+      "sfu:get-producers"
+    );
+    return { producers, peers: peers ?? [] };
+  }
+
+  /** Stop/start sending a kind of media (saves bandwidth while muted / camera off). */
+  public setPaused(kind: "audio" | "video", paused: boolean) {
+    this.producers
+      .filter((p) => p.kind === kind && !p.closed)
+      .forEach((p) => (paused ? p.pause() : p.resume()));
+  }
+
+  /** Tell the other participants whether our mic/camera are on. */
+  public sendMediaState(state: { audio: boolean; video: boolean }) {
+    if (this.closed) return;
+    this.socket.emit("sfu:media-state", { conversationId: this.conversationId, ...state });
   }
 
   /** Consume a remote producer. Returns null if it is already being consumed. */
@@ -152,6 +175,10 @@ export class MediasoupSFUService {
     });
     this.consumers.set(producerId, { consumer, socketId: consumerData.producerSocketId });
     consumer.on("transportclose", () => this.consumers.delete(producerId));
+
+    // The server creates consumers paused; resuming once we are ready makes it
+    // request a fresh keyframe, so video starts immediately instead of black.
+    await this.request("sfu:resume-consumer", { consumerId: consumer.id });
 
     return {
       consumer,

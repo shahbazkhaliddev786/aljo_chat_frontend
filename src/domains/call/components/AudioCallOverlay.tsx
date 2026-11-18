@@ -3,7 +3,8 @@
 import { useCallStore } from "@/shared/stores/call.store";
 import { useCallTimer } from "@/domains/call/hooks/useCallTimer";
 import CallToolbar from "./CallToolbar";
-import { Mic, Volume2 } from "lucide-react";
+import { MicOff, Volume2 } from "lucide-react";
+import { useAuthStore } from "@/shared/stores/auth.store";
 
 interface AudioCallOverlayProps {
   onEndCall: () => void;
@@ -12,6 +13,7 @@ interface AudioCallOverlayProps {
 export default function AudioCallOverlay({ onEndCall }: AudioCallOverlayProps) {
   const { remoteStreams, activeCall, isMicMuted, status } = useCallStore();
   const callStartTimeSet = useCallStore((s) => s.callStartTime !== null);
+  const myInitial = (useAuthStore((s) => s.user?.name) || "You").charAt(0).toUpperCase();
   const { formattedDuration } = useCallTimer();
 
   const participants = Object.values(remoteStreams);
@@ -43,10 +45,14 @@ export default function AudioCallOverlay({ onEndCall }: AudioCallOverlayProps) {
         {/* Local User */}
         <div className="flex flex-col items-center gap-2">
           <div className={`relative w-20 h-20 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center font-bold text-white text-2xl shadow-xl ${isMicMuted ? "opacity-60" : "ring-4 ring-indigo-500/40"}`}>
-            U
+            {myInitial}
             {isMicMuted && (
-              <span className="absolute bottom-0 right-0 p-1.5 bg-rose-600 rounded-full text-white border-2 border-slate-950">
-                <Mic className="w-3.5 h-3.5" />
+              <span
+                role="img"
+                aria-label="Your microphone is muted"
+                className="absolute bottom-0 right-0 p-1.5 bg-rose-600 rounded-full text-white border-2 border-slate-950"
+              >
+                <MicOff className="w-3.5 h-3.5" />
               </span>
             )}
           </div>
@@ -58,6 +64,15 @@ export default function AudioCallOverlay({ onEndCall }: AudioCallOverlayProps) {
           <div key={p.socketId || p.userId} className="flex flex-col items-center gap-2">
             <div className={`relative w-20 h-20 rounded-full bg-slate-800 border border-white/10 flex items-center justify-center font-bold text-indigo-300 text-2xl shadow-xl ${p.isSpeaking ? "ring-4 ring-emerald-500 animate-pulse" : ""}`}>
               {p.userName.charAt(0).toUpperCase()}
+              {p.isAudioMuted && (
+                <span
+                  role="img"
+                  aria-label={`${p.userName} is muted`}
+                  className="absolute bottom-0 right-0 p-1.5 bg-rose-600 rounded-full text-white border-2 border-slate-950"
+                >
+                  <MicOff className="w-3.5 h-3.5" />
+                </span>
+              )}
             </div>
             <span className="text-xs font-semibold text-white">{p.userName}</span>
           </div>

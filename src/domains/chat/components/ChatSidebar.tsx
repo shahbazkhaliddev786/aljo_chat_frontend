@@ -4,6 +4,8 @@ import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { hangUp } from "@/domains/call/services/call.controller";
 import { useCallStore } from "@/shared/stores/call.store";
+import { api } from "@/shared/lib/api-client";
+import { getAccessToken, getRefreshToken } from "@/shared/lib/auth-session";
 import { useConversations } from "@/domains/chat/hooks/useConversations";
 import { useUserSearch } from "@/domains/user/hooks/useUserSearch";
 import { useCreateDirectConversationMutation } from "@/domains/chat/hooks/useConversationMutations";
@@ -26,6 +28,13 @@ export default function ChatSidebar() {
 
   const handleLogout = () => {
     if (useCallStore.getState().status !== "idle") hangUp();
+    // Revoke this device's refresh token (best effort; tokens are cleared locally right after).
+    const refreshToken = getRefreshToken();
+    if (refreshToken) {
+      api
+        .post("/auth/logout", { refreshToken }, { headers: { Authorization: `Bearer ${getAccessToken()}` } })
+        .catch(() => {});
+    }
     // Drop cached conversations/messages so the next account never sees them.
     queryClient.clear();
     logout();
