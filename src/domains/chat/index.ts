@@ -13,7 +13,7 @@ export {
   useAddGroupMembersMutation,
   useRemoveGroupMemberMutation,
 } from "./hooks/useConversationMutations";
-export { useSendMessageMutation } from "./hooks/useMessageMutations";
+export { useSendMessage } from "./hooks/useSendMessage";
 export { getConversationTitle, getConversationAvatar, isPartnerOnline } from "./utils/chat.utils";
 export { default as ChatPage } from "./pages/ChatPage";
 export { default as ChatSidebar } from "./components/ChatSidebar";

@@ -1,11 +1,16 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useAuthStore } from "@/shared/stores/auth.store";
 import { useSocketStore } from "@/shared/stores/socket.store";
 import { useChatStore } from "@/shared/stores/chat.store";
 import { useQueryClient } from "@tanstack/react-query";
 import { IMessage } from "@/domains/chat/types";
+import { upsertMessage } from "@/domains/chat/utils/message-cache";
+
+// A typing indicator disappears on its own if the "stop" event never arrives
+// (e.g. the other user lost their connection mid-sentence).
+const TYPING_EXPIRY_MS = 6_000;
 
 export default function SocketProvider({ children }: { children: React.ReactNode }) {
   const token = useAuthStore((s) => s.token);
@@ -17,6 +22,7 @@ export default function SocketProvider({ children }: { children: React.ReactNode
   const setActiveConversation = useChatStore((s) => s.setActiveConversation);
   const activeConversationId = useChatStore((s) => s.activeConversationId);
   const queryClient = useQueryClient();
+  const typingTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
   useEffect(() => {
     if (isAuthenticated && token) {
@@ -30,10 +36,18 @@ export default function SocketProvider({ children }: { children: React.ReactNode
     if (!socket) return;
 
     const handleReceiveMessage = (message: IMessage) => {
-      queryClient.setQueryData<IMessage[]>(["messages", message.conversationId], (old = []) => {
-        if (old.some((m) => m.id === message.id)) return old;
-        return [...old, message];
-      });
+      upsertMessage(queryClient, message);
+      queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    };
+
+    // After a (re)connect, fetch whatever was missed while offline.
+    const handleConnect = () => {
+      queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      queryClient.invalidateQueries({ queryKey: ["messages"] });
+    };
+
+    // A contact published (or changed) their encryption key.
+    const handleUserKeyUpdated = () => {
       queryClient.invalidateQueries({ queryKey: ["conversations"] });
     };
 
@@ -69,16 +83,35 @@ export default function SocketProvider({ children }: { children: React.ReactNode
       queryClient.invalidateQueries({ queryKey: ["messages", conversationId] });
     };
 
+    const timers = typingTimers.current;
+    const clearTypingTimer = (key: string) => {
+      const timer = timers.get(key);
+      if (timer) clearTimeout(timer);
+      timers.delete(key);
+    };
+
     const handleTypingStart = ({ conversationId, userName }: { conversationId: string; userName: string }) => {
+      const key = `${conversationId}:${userName}`;
       setTypingUser(conversationId, userName);
+      clearTypingTimer(key);
+      timers.set(
+        key,
+        setTimeout(() => {
+          timers.delete(key);
+          removeTypingUser(conversationId, userName);
+        }, TYPING_EXPIRY_MS)
+      );
     };
 
     const handleTypingStop = ({ conversationId, userName }: { conversationId: string; userName: string }) => {
+      clearTypingTimer(`${conversationId}:${userName}`);
       removeTypingUser(conversationId, userName);
     };
 
     // Call events are handled by the call controller (see CallProvider).
 
+    socket.on("connect", handleConnect);
+    socket.on("user_key_updated", handleUserKeyUpdated);
     socket.on("receive_message", handleReceiveMessage);
     socket.on("group_deleted", handleConversationDeleted);
     socket.on("conversation_deleted", handleConversationDeleted);
@@ -89,6 +122,8 @@ export default function SocketProvider({ children }: { children: React.ReactNode
     socket.on("typing_stop", handleTypingStop);
 
     return () => {
+      socket.off("connect", handleConnect);
+      socket.off("user_key_updated", handleUserKeyUpdated);
       socket.off("receive_message", handleReceiveMessage);
       socket.off("group_deleted", handleConversationDeleted);
       socket.off("conversation_deleted", handleConversationDeleted);

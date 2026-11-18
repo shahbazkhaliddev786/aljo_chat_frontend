@@ -55,6 +55,7 @@ function VideoTile({
 
 export default function VideoGrid({ onEndCall }: VideoGridProps) {
   const { localStream, remoteStreams, activeCall, status } = useCallStore();
+  const callStartTimeSet = useCallStore((s) => s.callStartTime !== null);
   const { formattedDuration } = useCallTimer();
 
   const participants: RemoteParticipant[] = Object.values(remoteStreams);
@@ -70,6 +71,7 @@ export default function VideoGrid({ onEndCall }: VideoGridProps) {
   const getStatusText = () => {
     if (status === "connected") return `Connected • ${formattedDuration}`;
     if (status === "calling") return "Calling...";
+    if (status === "connecting") return callStartTimeSet ? "Reconnecting..." : "Connecting...";
     if (status === "incoming") return "Ringing...";
     return "";
   };

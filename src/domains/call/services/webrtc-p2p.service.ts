@@ -62,7 +62,15 @@ export class WebRTCP2PService {
     this.options.sendSignal({ type: "offer", sdp: offer });
   }
 
-  /** Callee side: apply the offer and send back an answer. */
+  /** Caller side: renegotiate with fresh ICE credentials after the connection failed. */
+  public async restartIce() {
+    if (this.closed) return;
+    const offer = await this.pc.createOffer({ iceRestart: true });
+    await this.pc.setLocalDescription(offer);
+    this.options.sendSignal({ type: "offer", sdp: offer });
+  }
+
+  /** Callee side: apply the offer (initial or ICE restart) and send back an answer. */
   public async handleOffer(offer: RTCSessionDescriptionInit) {
     await this.pc.setRemoteDescription(new RTCSessionDescription(offer));
     await this.flushPendingCandidates();

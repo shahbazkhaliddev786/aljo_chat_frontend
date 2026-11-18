@@ -17,10 +17,22 @@ export const messageService = {
     iv?: string;
     senderPublicKey?: string;
     recipientPublicKey?: string;
+    clientMessageId?: string;
     replyToId?: string;
   }): Promise<IMessage> => {
-    const { conversationId, content, file, type, isEncrypted, ciphertext, iv, senderPublicKey, recipientPublicKey, replyToId } =
-      params;
+    const {
+      conversationId,
+      content,
+      file,
+      type,
+      isEncrypted,
+      ciphertext,
+      iv,
+      senderPublicKey,
+      recipientPublicKey,
+      clientMessageId,
+      replyToId,
+    } = params;
 
     if (file) {
       const formData = new FormData();
@@ -33,6 +45,7 @@ export const messageService = {
       if (iv) formData.append("iv", iv);
       if (senderPublicKey) formData.append("senderPublicKey", senderPublicKey);
       if (recipientPublicKey) formData.append("recipientPublicKey", recipientPublicKey);
+      if (clientMessageId) formData.append("clientMessageId", clientMessageId);
 
       const res = await api.post(`/messages/${conversationId}`, formData, {
         headers: { "Content-Type": "multipart/form-data" },
@@ -48,6 +61,7 @@ export const messageService = {
       iv,
       senderPublicKey,
       recipientPublicKey,
+      clientMessageId,
       replyToId,
     });
     return res.data.data.message;

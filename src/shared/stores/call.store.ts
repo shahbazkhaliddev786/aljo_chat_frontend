@@ -1,7 +1,12 @@
 import { create } from "zustand";
 
 export type CallType = "audio" | "video";
-export type CallStatus = "idle" | "calling" | "incoming" | "connected";
+/**
+ * idle → calling (ringing the other side) / incoming (we are being rung)
+ *      → connecting (answered; media not flowing yet, or reconnecting)
+ *      → connected (media is flowing)
+ */
+export type CallStatus = "idle" | "calling" | "incoming" | "connecting" | "connected";
 export type CallMode = "direct" | "group";
 
 export interface ActiveCallInfo {
@@ -81,7 +86,8 @@ export const useCallStore = create<CallState>((set, get) => ({
 
   setCallConnected: () => {
     if (get().status === "connected") return;
-    set({ status: "connected", callStartTime: Date.now(), durationSeconds: 0 });
+    // Keep the running duration when recovering from a reconnect.
+    set((state) => ({ status: "connected", callStartTime: state.callStartTime ?? Date.now() }));
   },
 
   startCall: (info, stream) => {

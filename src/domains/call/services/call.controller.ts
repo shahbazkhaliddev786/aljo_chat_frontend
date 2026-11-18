@@ -21,6 +21,12 @@ import { getIceServers } from "./ice";
 const ACK_TIMEOUT_MS = 10_000;
 const NOTICE_MS = 4_000;
 const GROUP_RING_TIMEOUT_MS = 45_000;
+/** How long an answered call may take to get media flowing. */
+const CONNECT_TIMEOUT_MS = 30_000;
+/** Grace period for a "disconnected" peer connection to recover by itself. */
+const DISCONNECT_GRACE_MS = 8_000;
+/** How long an ICE restart may take before the call is dropped. */
+const ICE_RESTART_TIMEOUT_MS = 15_000;
 
 interface RemotePeer {
   userId: string;
@@ -42,6 +48,9 @@ let pendingProducerIds: string[] = [];
 let groupSession = 0;
 let groupRingTimer: ReturnType<typeof setTimeout> | null = null;
 let isAccepting = false;
+let connectTimer: ReturnType<typeof setTimeout> | null = null;
+let disconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let iceRestartAttempted = false;
 let noticeTimer: ReturnType<typeof setTimeout> | null = null;
 
 const store = () => useCallStore.getState();
@@ -83,8 +92,36 @@ async function emitWithAck(socket: Socket, event: string, payload: Record<string
   }
 }
 
+function clearConnectTimers() {
+  if (connectTimer) clearTimeout(connectTimer);
+  if (disconnectTimer) clearTimeout(disconnectTimer);
+  connectTimer = null;
+  disconnectTimer = null;
+}
+
+/**
+ * Enter the "connecting" state. If media is not flowing within `timeoutMs`,
+ * the call is dropped instead of hanging forever.
+ */
+function beginConnecting(timeoutMs = CONNECT_TIMEOUT_MS, failureNotice = "Could not connect the call") {
+  store().setCallStatus("connecting");
+  if (connectTimer) clearTimeout(connectTimer);
+  connectTimer = setTimeout(() => {
+    connectTimer = null;
+    if (store().status === "connecting") hangUp(failureNotice);
+  }, timeoutMs);
+}
+
+/** Media is flowing. */
+function markConnected() {
+  clearConnectTimers();
+  store().setCallConnected();
+}
+
 /** Release every media object of the current call and reset the store. */
 function teardown(notice?: string) {
+  clearConnectTimers();
+  iceRestartAttempted = false;
   if (groupRingTimer) clearTimeout(groupRingTimer);
   groupRingTimer = null;
   groupSession++;
@@ -137,6 +174,7 @@ export async function acceptIncomingCall(conversation?: IConversation) {
   if (!socket || !callId) return teardown();
 
   isAccepting = true;
+  beginConnecting();
   let stream: MediaStream;
   try {
     stream = await getLocalMedia(call.callType);
@@ -167,7 +205,7 @@ export async function acceptIncomingCall(conversation?: IConversation) {
   if (p2p !== service) return; // hung up while waiting
   isAccepting = false;
   if (res.error) return teardown("This call is no longer available");
-  store().setCallConnected();
+  // Stays "connecting" until the peer connection reports media is flowing.
 }
 
 export function rejectIncomingCall() {
@@ -195,10 +233,48 @@ function createP2P(callId: string, iceServers: RTCIceServer[], peer: RemotePeer)
       if (p2p === service) store().setRemoteStream({ socketId: "peer", ...peer }, stream);
     },
     onConnectionStateChange: (state) => {
-      if (p2p === service && state === "failed") hangUp("The call connection was lost");
+      if (p2p === service) handleP2PConnectionState(service, state);
     },
   });
   return service;
+}
+
+/**
+ * Recovery for 1-on-1 calls: a short network blip ("disconnected") gets a grace
+ * period, and a failed connection gets one ICE restart (driven by the caller)
+ * before the call is dropped.
+ */
+function handleP2PConnectionState(service: WebRTCP2PService, state: RTCPeerConnectionState) {
+  if (state === "connected") {
+    markConnected();
+    return;
+  }
+
+  if (state === "disconnected") {
+    if (disconnectTimer) return;
+    disconnectTimer = setTimeout(() => {
+      disconnectTimer = null;
+      if (p2p === service && store().status === "connected") recoverP2P(service);
+    }, DISCONNECT_GRACE_MS);
+    return;
+  }
+
+  if (state === "failed") recoverP2P(service);
+}
+
+function recoverP2P(service: WebRTCP2PService) {
+  if (iceRestartAttempted) return hangUp("The call connection was lost");
+  iceRestartAttempted = true;
+
+  // Only the caller restarts ICE (avoids both sides sending offers at once);
+  // the callee waits for the caller's new offer.
+  beginConnecting(ICE_RESTART_TIMEOUT_MS, "The call connection was lost");
+  if (store().activeCall?.isInitiator) {
+    service.restartIce().catch((err) => {
+      console.error("ICE restart failed", err);
+      hangUp("The call connection was lost");
+    });
+  }
 }
 
 async function startDirectCall(
@@ -270,7 +346,7 @@ async function handleCallAccepted({ callId }: { callId: string }) {
   });
   const local = store().localStream;
   if (local) p2p.addLocalStream(local);
-  store().setCallConnected();
+  beginConnecting();
 
   try {
     await p2p.createOffer();
@@ -355,7 +431,7 @@ async function consumeRemote(service: MediasoupSFUService, producerId: string) {
       { socketId: consumed.socketId, userId: consumed.userId, userName: consumed.userName },
       consumed.track
     );
-    store().setCallConnected();
+    markConnected();
   } catch (err) {
     console.error("Failed to consume producer", producerId, err);
   }
@@ -391,8 +467,12 @@ async function joinGroupCall(conversation: IConversation, callType: CallType, is
     stream
   );
   isAccepting = false;
+  // Someone joining an existing call connects right away; the initiator rings.
+  if (!isInitiator) beginConnecting();
 
-  const service = new MediasoupSFUService(socket, conversation.id, await getIceServers());
+  const service: MediasoupSFUService = new MediasoupSFUService(socket, conversation.id, await getIceServers(), () => {
+    if (sfu === service) teardown("The call connection was lost");
+  });
   if (session !== groupSession) return;
   sfu = service;
 

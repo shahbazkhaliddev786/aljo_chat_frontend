@@ -48,7 +48,9 @@ export class MediasoupSFUService {
   constructor(
     private socket: Socket,
     private conversationId: string,
-    private iceServers: RTCIceServer[]
+    private iceServers: RTCIceServer[],
+    /** Called once if a media transport fails for good (network lost). */
+    private onConnectionFailed?: () => void
   ) {}
 
   private async request<T>(event: string, payload: Record<string, unknown> = {}): Promise<T> {
@@ -81,6 +83,10 @@ export class MediasoupSFUService {
     const options = { ...transportParams, iceServers: this.iceServers };
     const transport =
       direction === "send" ? this.device.createSendTransport(options) : this.device.createRecvTransport(options);
+
+    transport.on("connectionstatechange", (state) => {
+      if (state === "failed" && !this.closed) this.onConnectionFailed?.();
+    });
 
     transport.on("connect", ({ dtlsParameters }, callback, errback) => {
       this.request("sfu:connect-transport", { transportId: transport.id, dtlsParameters })

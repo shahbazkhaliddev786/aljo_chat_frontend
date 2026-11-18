@@ -6,7 +6,8 @@ import { useAuthStore } from "@/shared/stores/auth.store";
 import { useCryptoStore } from "@/shared/stores/crypto.store";
 import { useSocketStore } from "@/shared/stores/socket.store";
 import { useMessages } from "@/domains/chat/hooks/useMessages";
-import { useSendMessageMutation } from "@/domains/chat/hooks/useMessageMutations";
+import { useConversations } from "@/domains/chat/hooks/useConversations";
+import { useSendMessage, OutgoingPayload } from "@/domains/chat/hooks/useSendMessage";
 import {
   useLeaveGroupMutation,
   useDeleteGroupMutation,
@@ -19,7 +20,9 @@ import {
   Lock,
   Send,
   Image as ImageIcon,
-  CheckCheck,
+  Check,
+  Clock,
+  AlertCircle,
   Users,
   ShieldCheck,
   Sparkles,
@@ -32,12 +35,14 @@ import {
   Video,
 } from "lucide-react";
 import ManageMembersModal from "@/domains/chat/components/ManageMembersModal";
-import { IMessage } from "@/domains/chat/types";
-
-const SEND_TIMEOUT_MS = 10_000;
 
 export default function ChatWindow() {
-  const activeConversation = useChatStore((s) => s.activeConversation);
+  const selectedConversation = useChatStore((s) => s.activeConversation);
+  // The store holds a snapshot taken when the chat was opened; always prefer the
+  // live copy so member lists, roles and encryption keys stay current.
+  const { data: conversations } = useConversations();
+  const activeConversation =
+    (selectedConversation && conversations?.find((c) => c.id === selectedConversation.id)) || selectedConversation;
   const setActiveConversation = useChatStore((s) => s.setActiveConversation);
   const currentUser = useAuthStore((s) => s.user);
 
@@ -46,7 +51,7 @@ export default function ChatWindow() {
   const typingUsers = useChatStore((s) => s.typingUsers);
 
   const { data: rawMessages = [], isLoading } = useMessages(activeConversation?.id || null);
-  const sendMessageMutation = useSendMessageMutation();
+  const { send, retry, discard } = useSendMessage();
   const leaveGroupMutation = useLeaveGroupMutation();
   const deleteGroupMutation = useDeleteGroupMutation();
   const deleteDirectMutation = useDeleteDirectMutation();
@@ -183,64 +188,52 @@ export default function ChatWindow() {
     if (!inputText.trim() && !selectedFile) return;
 
     const messageText = inputText.trim();
-    const fileToSend = selectedFile;
+    const fileToSend = selectedFile || undefined;
     setSendError(null);
 
-    try {
-      let encryption: {
-        isEncrypted: boolean;
-        ciphertext?: string;
-        iv?: string;
-        senderPublicKey?: string;
-        recipientPublicKey?: string;
-      } = { isEncrypted: false };
+    let payload: OutgoingPayload = {
+      type: fileToSend ? (fileToSend.type.startsWith("image/") ? "image" : "file") : "text",
+      isEncrypted: false,
+      content: messageText || undefined,
+    };
 
-      if (canEncrypt && messageText) {
-        if (!privateKey || !publicKeyJwk) {
-          // Never silently fall back to plaintext in an encrypted chat.
-          setSendError("Your encryption keys are not available on this device. Please sign in again.");
-          return;
-        }
+    if (canEncrypt && messageText) {
+      if (!privateKey || !publicKeyJwk) {
+        // Never silently fall back to plaintext in an encrypted chat.
+        setSendError("Your encryption keys are not available on this device. Please sign in again.");
+        return;
+      }
+      try {
         const encrypted = await encryptE2EEMessage(messageText, partner!.publicKey!, privateKey);
-        encryption = {
+        payload = {
+          type: payload.type,
+          // Plaintext is never sent for encrypted messages.
           isEncrypted: true,
           ciphertext: encrypted.ciphertext,
           iv: encrypted.iv,
           senderPublicKey: publicKeyJwk,
           recipientPublicKey: partner!.publicKey!,
         };
+      } catch (err) {
+        console.error("Failed to encrypt message", err);
+        setSendError("Could not encrypt the message. Please try again.");
+        return;
       }
+    }
 
-      setInputText("");
-      setSelectedFile(null);
+    // The message appears immediately as "sending"; failures stay in the list with a Retry button.
+    setInputText("");
+    setSelectedFile(null);
+    const stored = await send(activeConversation.id, payload, { plaintext: messageText || undefined, file: fileToSend });
+    if (stored?.isEncrypted && messageText) {
+      setDecryptedMap((prev) => ({ ...prev, [stored.id]: messageText }));
+    }
+  };
 
-      // Plaintext is only ever sent for unencrypted messages.
-      const content = encryption.isEncrypted ? undefined : messageText || undefined;
-
-      if (fileToSend) {
-        await sendMessageMutation.mutateAsync({
-          conversationId: activeConversation.id,
-          content,
-          file: fileToSend,
-          type: fileToSend.type.startsWith("image/") ? "image" : "file",
-          ...encryption,
-        });
-      } else {
-        if (!socket?.connected) throw new Error("You are offline");
-        const res = (await socket
-          .timeout(SEND_TIMEOUT_MS)
-          .emitWithAck("send_message", { conversationId: activeConversation.id, content, ...encryption })) as {
-          error?: string;
-          message?: IMessage;
-        };
-        if (res.error) throw new Error(res.error);
-      }
-    } catch (err) {
-      console.error("Failed to send message", err);
-      // Give the text back so nothing is lost.
-      setInputText((current) => current || messageText);
-      setSelectedFile((current) => current || fileToSend);
-      setSendError("Message not sent. Please try again.");
+  const handleRetry = async (clientMessageId: string, plaintext?: string) => {
+    const stored = await retry(clientMessageId);
+    if (stored?.isEncrypted && plaintext) {
+      setDecryptedMap((prev) => ({ ...prev, [stored.id]: plaintext }));
     }
   };
 
@@ -433,9 +426,11 @@ export default function ChatWindow() {
             ) : (
               rawMessages.map((msg) => {
                 const isMe = msg.senderId === currentUser?.id;
-                const displayContent = msg.isEncrypted
-                  ? decryptedMap[msg.id] || "🔒 Decrypting..."
-                  : msg.content;
+                const displayContent = msg.localStatus
+                  ? msg.localPlaintext || (msg.localFileName ? `📎 ${msg.localFileName}` : "")
+                  : msg.isEncrypted
+                    ? decryptedMap[msg.id] || "🔒 Decrypting..."
+                    : msg.content;
 
                 return (
                   <div
@@ -496,7 +491,33 @@ export default function ChatWindow() {
                             minute: "2-digit",
                           })}
                         </span>
-                        {isMe && <CheckCheck className="w-3.5 h-3.5 text-indigo-400" />}
+                        {isMe && msg.localStatus === "sending" && (
+                          <span className="inline-flex items-center gap-1" aria-label="Sending">
+                            <Clock className="w-3 h-3" /> Sending…
+                          </span>
+                        )}
+                        {isMe && msg.localStatus === "failed" && (
+                          <span className="inline-flex items-center gap-1.5 text-rose-400" role="alert">
+                            <AlertCircle className="w-3 h-3" /> Not sent
+                            <button
+                              type="button"
+                              onClick={() => handleRetry(msg.clientMessageId!, msg.localPlaintext)}
+                              className="underline font-semibold hover:text-rose-300"
+                            >
+                              Retry
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => discard(msg.conversationId, msg.clientMessageId!)}
+                              className="underline hover:text-rose-300"
+                            >
+                              Delete
+                            </button>
+                          </span>
+                        )}
+                        {isMe && !msg.localStatus && (
+                          <Check className="w-3.5 h-3.5 text-indigo-400" aria-label="Sent" />
+                        )}
                       </div>
                     </div>
                   </div>

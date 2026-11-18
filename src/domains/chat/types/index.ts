@@ -23,6 +23,8 @@ export interface IMessage {
   /** Public keys used to derive this message's key (E2EE). */
   senderPublicKey?: string | null;
   recipientPublicKey?: string | null;
+  /** Client-generated id; lets an optimistic message be matched with the stored one. */
+  clientMessageId?: string | null;
   isEdited: boolean;
   isDeleted: boolean;
   createdAt: string;
@@ -38,6 +40,12 @@ export interface IMessage {
     emoji: string;
     userId: string;
   }>;
+  /** Client-only: set on optimistic messages that are not confirmed by the server yet. */
+  localStatus?: "sending" | "failed";
+  /** Client-only: what the sender typed (shown before the server confirms the message). */
+  localPlaintext?: string;
+  /** Client-only: name of a file that is being uploaded. */
+  localFileName?: string;
 }
 
 export interface IConversation {
