@@ -66,6 +66,7 @@ function VideoTile({
       <div className="absolute bottom-3 left-3 px-3 py-1 bg-black/60 backdrop-blur-md rounded-xl border border-white/10 text-xs font-semibold text-white flex items-center gap-1.5 z-10">
         <span>{name}</span>
         {isLocal && <span className="text-[10px] text-indigo-400">(You)</span>}
+        {isSpeaking && <span className="sr-only" data-testid="speaking">speaking</span>}
         {isAudioMuted && (
           <span role="img" aria-label="Microphone muted" title="Microphone muted">
             <MicOff className="w-3.5 h-3.5 text-rose-400" />

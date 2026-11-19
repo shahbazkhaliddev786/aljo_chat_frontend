@@ -15,15 +15,25 @@ import {
 } from "@/domains/chat/hooks/useConversationMutations";
 import { startCall } from "@/domains/call/services/call.controller";
 
-import { encryptE2EEMessage, decryptE2EEMessage } from "@/shared/lib/crypto";
+import { encryptFile, keyFingerprint } from "@/shared/lib/crypto";
+import { checkContactKey, trustContactKey, KeyTrust } from "@/shared/lib/known-keys";
 import {
-  Lock,
+  getEncryptionMode,
+  encryptForConversation,
+  decryptMessage,
+  buildAttachmentText,
+  parseAttachmentText,
+  decryptionCacheKey,
+  AttachmentMeta,
+} from "@/domains/chat/utils/message-crypto";
+import { editMessage, deleteMessage, toggleReaction } from "@/domains/chat/services/message-actions";
+import { IMessage } from "@/domains/chat/types";
+import MessageItem from "@/domains/chat/components/MessageItem";
+import SafetyNumberModal from "@/domains/chat/components/SafetyNumberModal";
+import {
   Send,
   Image as ImageIcon,
-  Check,
-  CheckCheck,
-  Clock,
-  AlertCircle,
+  X,
   Users,
   ShieldCheck,
   Sparkles,
@@ -65,6 +75,10 @@ export default function ChatWindow() {
   const [isManageMembersOpen, setIsManageMembersOpen] = useState(false);
   const [confirmAction, setConfirmAction] = useState<"leave" | "deleteGroup" | "deleteDirect" | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [replyTo, setReplyTo] = useState<IMessage | null>(null);
+  const [editing, setEditing] = useState<IMessage | null>(null);
+  const [isSafetyOpen, setIsSafetyOpen] = useState(false);
+  const [keyTrustState, setKeyTrust] = useState<{ forKey: string; fingerprint: string; trust: KeyTrust } | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -119,57 +133,59 @@ export default function ChatWindow() {
     void loadOlder();
   };
 
-  // Decrypt incoming E2EE messages in real-time
+  // Decrypt E2EE messages (direct and group). Cached per message *version*, so
+  // an edit (re-encrypted with a new iv) is decrypted again.
   useEffect(() => {
-    if (!privateKey || !activeConversation) return;
-
+    if (!privateKey || !activeConversation || !currentUser) return;
     let isMounted = true;
 
-    const decryptAll = async () => {
-      const partnerMember = activeConversation.members.find((m) => m.id !== currentUser?.id);
+    (async () => {
       const newEntries: Record<string, string> = {};
-      let hasNewDecryption = false;
-
       for (const msg of rawMessages) {
-        if (msg.isEncrypted && msg.ciphertext && msg.iv && !decryptedMap[msg.id]) {
-          try {
-            // ECDH is symmetric: decrypt with *our* private key and the *other*
-            // side's public key, using the exact keys recorded when the message
-            // was sent (falls back to current keys for older messages).
-            const counterpartPubKey =
-              msg.senderId === currentUser?.id
-                ? msg.recipientPublicKey || partnerMember?.publicKey
-                : msg.senderPublicKey || msg.sender?.publicKey;
-
-            if (counterpartPubKey && privateKey) {
-              const plain = await decryptE2EEMessage(
-                msg.ciphertext,
-                msg.iv,
-                counterpartPubKey,
-                privateKey
-              );
-              newEntries[msg.id] = plain;
-              hasNewDecryption = true;
-            }
-          } catch (err) {
-            console.error("Failed to decrypt message:", msg.id, err);
-            newEntries[msg.id] = "[Unable to decrypt message]";
-            hasNewDecryption = true;
-          }
+        const key = decryptionCacheKey(msg);
+        if (!msg.isEncrypted || msg.isDeleted || !msg.ciphertext || decryptedMap[key] !== undefined) continue;
+        try {
+          newEntries[key] = await decryptMessage(msg, activeConversation, currentUser.id, privateKey);
+        } catch (err) {
+          console.error("Failed to decrypt message:", msg.id, err);
+          newEntries[key] = "[Unable to decrypt message]";
         }
       }
-
-      if (isMounted && hasNewDecryption) {
+      if (isMounted && Object.keys(newEntries).length > 0) {
         setDecryptedMap((prev) => ({ ...prev, ...newEntries }));
       }
-    };
-
-    decryptAll();
+    })();
 
     return () => {
       isMounted = false;
     };
+    // decryptedMap is read only to skip work already done
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rawMessages, privateKey, activeConversation, currentUser]);
+
+  // Key-change detection for direct chats (trust on first use + safety numbers).
+  const directPartner =
+    activeConversation?.type === "direct"
+      ? activeConversation.members.find((m) => m.id !== currentUser?.id)
+      : undefined;
+  const directPartnerKey = directPartner?.publicKey;
+  const directPartnerId = directPartner?.id;
+  useEffect(() => {
+    if (!currentUser || !directPartnerId || !directPartnerKey) return;
+    let cancelled = false;
+    keyFingerprint(directPartnerKey)
+      .then((fingerprint) => {
+        if (cancelled) return;
+        const trust = checkContactKey(currentUser.id, directPartnerId, fingerprint);
+        setKeyTrust({ forKey: directPartnerKey, fingerprint, trust });
+      })
+      .catch(console.error);
+    return () => {
+      cancelled = true;
+    };
+  }, [currentUser, directPartnerId, directPartnerKey]);
+  // Only trust results computed for the partner's *current* key.
+  const keyTrust = keyTrustState && keyTrustState.forKey === directPartnerKey ? keyTrustState : null;
 
   if (!activeConversation) {
     return (
@@ -198,8 +214,48 @@ export default function ChatWindow() {
   const readIndexes = otherMembers.map((m) => (m.lastReadMessageId ? (messageIndex.get(m.lastReadMessageId) ?? -1) : -1));
   const readCountAt = (index: number) => readIndexes.filter((r) => r >= index).length;
 
-  // Direct chats are encrypted when both sides have published a key.
-  const canEncrypt = isDirectChat && !!partner?.publicKey;
+  // Direct: pairwise key. Group: per-message key wrapped for every member.
+  // If anyone has no key yet, messages are sent unencrypted and labelled as such.
+  const encryptionMode = getEncryptionMode(activeConversation, currentUser?.id);
+  const canEncrypt = encryptionMode.kind !== "none";
+  const memberNames = Object.fromEntries(activeConversation.members.map((m) => [m.id, m.name]));
+
+  /** Text to show for a message, or undefined while it is still being decrypted. */
+  const resolveText = (msg: IMessage): string | undefined => {
+    if (msg.localStatus) return msg.localPlaintext ?? (msg.localFileName ? `📎 ${msg.localFileName}` : "");
+    if (msg.isDeleted) return "";
+    if (msg.isEncrypted) return decryptedMap[decryptionCacheKey(msg)];
+    return msg.content ?? "";
+  };
+
+  /** Split an encrypted attachment payload into caption + file metadata. */
+  const resolveContent = (msg: IMessage): { text?: string; attachment?: AttachmentMeta } => {
+    const text = resolveText(msg);
+    if (text === undefined || !msg.isEncrypted || msg.localStatus || !(msg.type === "image" || msg.type === "file")) {
+      return { text };
+    }
+    const { caption, file } = parseAttachmentText(text);
+    return { text: caption ?? "", attachment: file };
+  };
+
+  const previewOf = (msg: IMessage): string => {
+    if (msg.isDeleted) return "This message was deleted";
+    const { text, attachment } = resolveContent(msg);
+    if (attachment) return `📎 ${attachment.name}${text ? ` — ${text}` : ""}`;
+    if (text === undefined) return "🔒 Encrypted message";
+    return text || (msg.mediaUrl ? "📎 Attachment" : "");
+  };
+
+  const replyPreviewFor = (msg: IMessage) => {
+    if (!msg.replyToId) return null;
+    const original = rawMessages.find((m) => m.id === msg.replyToId);
+    if (!original) return { name: "Earlier message", text: "Original message is not loaded" };
+    return { name: original.sender?.name || "Someone", text: previewOf(original) };
+  };
+
+  const remember = (msg: IMessage | null, text: string) => {
+    if (msg?.isEncrypted) setDecryptedMap((prev) => ({ ...prev, [decryptionCacheKey(msg)]: text }));
+  };
 
   const handleStartCall = (callType: "audio" | "video") => {
     void startCall(activeConversation, callType);
@@ -228,36 +284,47 @@ export default function ChatWindow() {
     }
   };
 
+  const keysMissingMessage = "Your encryption keys are not available on this device. Please sign in again.";
+
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (editing) return handleSaveEdit();
     if (!inputText.trim() && !selectedFile) return;
 
     const messageText = inputText.trim();
     const fileToSend = selectedFile || undefined;
     setSendError(null);
 
-    let payload: OutgoingPayload = {
-      type: fileToSend ? (fileToSend.type.startsWith("image/") ? "image" : "file") : "text",
-      isEncrypted: false,
-      content: messageText || undefined,
-    };
+    if (canEncrypt && (!privateKey || !publicKeyJwk)) {
+      // Never silently fall back to plaintext in an encrypted chat.
+      setSendError(keysMissingMessage);
+      return;
+    }
 
-    if (canEncrypt && messageText) {
-      if (!privateKey || !publicKeyJwk) {
-        // Never silently fall back to plaintext in an encrypted chat.
-        setSendError("Your encryption keys are not available on this device. Please sign in again.");
-        return;
-      }
+    const type: "text" | "image" | "file" = fileToSend
+      ? fileToSend.type.startsWith("image/")
+        ? "image"
+        : "file"
+      : "text";
+    let payload: OutgoingPayload = { type, isEncrypted: false, content: messageText || undefined, replyToId: replyTo?.id };
+    let upload: File | undefined = fileToSend;
+    let storedText = messageText;
+
+    if (canEncrypt) {
       try {
-        const encrypted = await encryptE2EEMessage(messageText, partner!.publicKey!, privateKey);
+        if (fileToSend) {
+          // The file is encrypted with its own key; that key travels inside the encrypted message.
+          const encrypted = await encryptFile(fileToSend);
+          upload = new File([encrypted.blob], "encrypted.bin", { type: "application/octet-stream" });
+          storedText = buildAttachmentText(
+            { key: encrypted.key, iv: encrypted.iv, name: fileToSend.name, mime: fileToSend.type, size: fileToSend.size },
+            messageText
+          );
+        }
         payload = {
-          type: payload.type,
-          // Plaintext is never sent for encrypted messages.
-          isEncrypted: true,
-          ciphertext: encrypted.ciphertext,
-          iv: encrypted.iv,
-          senderPublicKey: publicKeyJwk,
-          recipientPublicKey: partner!.publicKey!,
+          type,
+          replyToId: replyTo?.id,
+          ...(await encryptForConversation(encryptionMode, storedText, privateKey!, publicKeyJwk!)),
         };
       } catch (err) {
         console.error("Failed to encrypt message", err);
@@ -269,17 +336,84 @@ export default function ChatWindow() {
     // The message appears immediately as "sending"; failures stay in the list with a Retry button.
     setInputText("");
     setSelectedFile(null);
-    const stored = await send(activeConversation.id, payload, { plaintext: messageText || undefined, file: fileToSend });
-    if (stored?.isEncrypted && messageText) {
-      setDecryptedMap((prev) => ({ ...prev, [stored.id]: messageText }));
+    setReplyTo(null);
+    const stored = await send(activeConversation.id, payload, {
+      plaintext: messageText || undefined,
+      file: upload,
+      fileName: fileToSend?.name,
+    });
+    remember(stored, storedText);
+  };
+
+  const startEdit = (msg: IMessage) => {
+    setReplyTo(null);
+    setEditing(msg);
+    setInputText(resolveText(msg) ?? "");
+  };
+
+  const cancelComposerMode = () => {
+    if (editing) setInputText("");
+    setEditing(null);
+    setReplyTo(null);
+  };
+
+  const handleSaveEdit = async () => {
+    const msg = editing!;
+    const newText = inputText.trim();
+    if (!newText) return;
+    if (newText === resolveText(msg)) return cancelComposerMode();
+    setSendError(null);
+
+    try {
+      let fields: Parameters<typeof editMessage>[0] = { messageId: msg.id, content: newText };
+      if (msg.isEncrypted) {
+        if (!canEncrypt || !privateKey || !publicKeyJwk) {
+          setSendError(canEncrypt ? keysMissingMessage : "This chat can no longer be encrypted, so the message cannot be edited.");
+          return;
+        }
+        fields = { messageId: msg.id, ...(await encryptForConversation(encryptionMode, newText, privateKey, publicKeyJwk)) };
+      }
+      const { message } = await editMessage(fields);
+      remember(message, newText);
+      setEditing(null);
+      setInputText("");
+    } catch (err) {
+      console.error("Failed to edit message", err);
+      setSendError(err instanceof Error ? err.message : "Could not edit the message.");
     }
   };
 
-  const handleRetry = async (clientMessageId: string, plaintext?: string) => {
-    const stored = await retry(clientMessageId);
-    if (stored?.isEncrypted && plaintext) {
-      setDecryptedMap((prev) => ({ ...prev, [stored.id]: plaintext }));
+  const handleDeleteMessage = async (msg: IMessage) => {
+    if (!window.confirm("Delete this message for everyone?")) return;
+    try {
+      await deleteMessage(msg.id);
+    } catch (err) {
+      console.error("Failed to delete message", err);
+      setSendError(err instanceof Error ? err.message : "Could not delete the message.");
     }
+  };
+
+  const handleReact = async (msg: IMessage, emoji: string) => {
+    try {
+      await toggleReaction(msg.id, emoji);
+    } catch (err) {
+      console.error("Failed to react", err);
+    }
+  };
+
+  const handleRetry = async (msg: IMessage) => {
+    const plaintext = msg.localPlaintext;
+    let fresh: OutgoingPayload | undefined;
+    // Re-encrypt text for the *current* members (someone may have joined since).
+    if (canEncrypt && privateKey && publicKeyJwk && plaintext && msg.type === "text") {
+      fresh = {
+        type: "text",
+        replyToId: msg.replyToId ?? undefined,
+        ...(await encryptForConversation(encryptionMode, plaintext, privateKey, publicKeyJwk)),
+      };
+    }
+    const stored = await retry(msg.clientMessageId!, fresh);
+    if (plaintext && stored?.type === "text") remember(stored, plaintext);
   };
 
   const handleConfirmAction = async () => {
@@ -315,19 +449,29 @@ export default function ChatWindow() {
               <h2 className="text-sm font-bold text-white">
                 {isDirectChat ? partner?.name : activeConversation.title || "Group Chat"}
               </h2>
-              {isDirectChat &&
-                (canEncrypt ? (
+              {canEncrypt ? (
+                isDirectChat && publicKeyJwk && partner?.publicKey ? (
+                  <button
+                    onClick={() => setIsSafetyOpen(true)}
+                    title="Verify this chat's encryption with a safety number"
+                    className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/30"
+                  >
+                    <ShieldCheck className="w-3 h-3" />
+                    {keyTrust?.trust === "verified" ? "E2EE · Verified" : "E2EE Encrypted"}
+                  </button>
+                ) : (
                   <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
                     <ShieldCheck className="w-3 h-3" /> E2EE Encrypted
                   </span>
-                ) : (
-                  <span
-                    title="This contact has not set up encryption yet. Messages are not end-to-end encrypted."
-                    className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30"
-                  >
-                    Not encrypted
-                  </span>
-                ))}
+                )
+              ) : (
+                <span
+                  title={`${encryptionMode.kind === "none" ? encryptionMode.reason : ""} Messages are not end-to-end encrypted.`}
+                  className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30"
+                >
+                  Not encrypted
+                </span>
+              )}
             </div>
 
             <p className="text-xs text-gray-400">
@@ -416,6 +560,41 @@ export default function ChatWindow() {
         </div>
       </div>
 
+      {isSafetyOpen && partner?.publicKey && publicKeyJwk && keyTrust && (
+        <SafetyNumberModal
+          partnerName={partner.name}
+          myPublicKey={publicKeyJwk}
+          partnerPublicKey={partner.publicKey}
+          isVerified={keyTrust.trust === "verified"}
+          onVerify={() => {
+            trustContactKey(currentUser!.id, partner.id, keyTrust.fingerprint, true);
+            setKeyTrust({ ...keyTrust, trust: "verified" });
+          }}
+          onClose={() => setIsSafetyOpen(false)}
+        />
+      )}
+
+      {keyTrust?.trust === "changed" && partner && (
+        <div role="alert" className="px-4 py-2.5 bg-amber-500/10 border-b border-amber-500/30 text-xs text-amber-200 flex flex-wrap items-center gap-2">
+          <span className="flex-1 min-w-[200px]">
+            {partner.name}&apos;s security code changed. This is normal after they reset their account, but it could
+            also mean someone is intercepting the chat.
+          </span>
+          <button onClick={() => setIsSafetyOpen(true)} className="underline font-semibold">
+            Verify
+          </button>
+          <button
+            onClick={() => {
+              trustContactKey(currentUser!.id, partner.id, keyTrust.fingerprint, false);
+              setKeyTrust({ ...keyTrust, trust: "same" });
+            }}
+            className="underline"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {/* Manage Members Modal */}
           {isManageMembersOpen && (
             <ManageMembersModal
@@ -483,120 +662,41 @@ export default function ChatWindow() {
             ) : (
               rawMessages.map((msg, index) => {
                 const isMe = msg.senderId === currentUser?.id;
-                const displayContent = msg.localStatus
-                  ? msg.localPlaintext || (msg.localFileName ? `📎 ${msg.localFileName}` : "")
-                  : msg.isEncrypted
-                    ? decryptedMap[msg.id] || "🔒 Decrypting..."
-                    : msg.content;
-
+                const { text, attachment } = resolveContent(msg);
+                const readers = readCountAt(index);
+                const readByAll = otherMembers.length > 0 && readers === otherMembers.length;
+                const receipt = {
+                  readByAll,
+                  label: readByAll
+                    ? isDirectChat
+                      ? "Read"
+                      : "Read by everyone"
+                    : !isDirectChat && readers > 0
+                      ? `Read by ${readers} of ${otherMembers.length}`
+                      : "Sent",
+                };
                 return (
-                  <div
+                  <MessageItem
                     key={msg.id}
-                    className={`flex gap-3 max-w-[80%] ${isMe ? "ml-auto flex-row-reverse" : ""}`}
-                  >
-                    <div className="w-8 h-8 rounded-full bg-indigo-600/30 flex items-center justify-center text-indigo-300 font-bold text-xs shrink-0">
-                      {msg.sender?.name?.charAt(0).toUpperCase() || "U"}
-                    </div>
-
-                    <div>
-                      <div
-                        className={`p-3.5 rounded-2xl text-xs leading-relaxed shadow-lg relative ${isMe
-                            ? "bg-indigo-600 text-white rounded-tr-none"
-                            : "bg-slate-900/90 text-gray-200 border border-white/10 rounded-tl-none"
-                          }`}
-                      >
-                        {!isMe && !isDirectChat && (
-                          <p className="text-[10px] font-semibold text-indigo-400 mb-1">
-                            {msg.sender?.name}
-                          </p>
-                        )}
-
-                        {msg.isEncrypted && (
-                          <div className="flex items-center gap-1 text-[10px] text-emerald-300 font-semibold mb-1">
-                            <Lock className="w-3 h-3" /> End-to-End Encrypted
-                          </div>
-                        )}
-
-                        {msg.mediaUrl && (
-                          <div className="mb-2 rounded-xl overflow-hidden max-w-xs border border-white/10">
-                            {msg.type === "image" ? (
-                              // eslint-disable-next-line @next/next/no-img-element
-                              <img src={msg.mediaUrl} alt="Attachment" className="w-full object-cover" />
-                            ) : (
-                              <a
-                                href={msg.mediaUrl}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="p-2 bg-slate-800 text-indigo-400 underline block"
-                              >
-                                📎 View Attachment
-                              </a>
-                            )}
-                          </div>
-                        )}
-
-                        {displayContent && <p className="whitespace-pre-wrap">{displayContent}</p>}
-                      </div>
-
-                      <div
-                        className={`flex items-center gap-1 mt-1 text-[10px] text-gray-500 ${isMe ? "justify-end" : "justify-start"
-                          }`}
-                      >
-                        <span>
-                          {new Date(msg.createdAt).toLocaleTimeString([], {
-                            hour: "2-digit",
-                            minute: "2-digit",
-                          })}
-                        </span>
-                        {isMe && msg.localStatus === "sending" && (
-                          <span className="inline-flex items-center gap-1" aria-label="Sending">
-                            <Clock className="w-3 h-3" /> Sending…
-                          </span>
-                        )}
-                        {isMe && msg.localStatus === "failed" && (
-                          <span className="inline-flex items-center gap-1.5 text-rose-400" role="alert">
-                            <AlertCircle className="w-3 h-3" /> Not sent
-                            <button
-                              type="button"
-                              onClick={() => handleRetry(msg.clientMessageId!, msg.localPlaintext)}
-                              className="underline font-semibold hover:text-rose-300"
-                            >
-                              Retry
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => discard(msg.conversationId, msg.clientMessageId!)}
-                              className="underline hover:text-rose-300"
-                            >
-                              Delete
-                            </button>
-                          </span>
-                        )}
-                        {isMe &&
-                          !msg.localStatus &&
-                          (() => {
-                            const readers = readCountAt(index);
-                            const readByAll = otherMembers.length > 0 && readers === otherMembers.length;
-                            const label = readByAll
-                              ? isDirectChat
-                                ? "Read"
-                                : "Read by everyone"
-                              : !isDirectChat && readers > 0
-                                ? `Read by ${readers} of ${otherMembers.length}`
-                                : "Sent";
-                            return (
-                              <span role="img" aria-label={label} title={label}>
-                                {readByAll ? (
-                                  <CheckCheck className="w-3.5 h-3.5 text-sky-400" />
-                                ) : (
-                                  <Check className="w-3.5 h-3.5 text-indigo-400" />
-                                )}
-                              </span>
-                            );
-                          })()}
-                      </div>
-                    </div>
-                  </div>
+                    msg={msg}
+                    isMe={isMe}
+                    showSenderName={!isDirectChat}
+                    text={text}
+                    attachment={attachment}
+                    replyPreview={replyPreviewFor(msg)}
+                    receipt={receipt}
+                    myUserId={currentUser?.id}
+                    memberNames={memberNames}
+                    onReply={() => {
+                      setEditing(null);
+                      setReplyTo(msg);
+                    }}
+                    onEdit={isMe && msg.type === "text" && text !== undefined ? () => startEdit(msg) : undefined}
+                    onDelete={isMe ? () => handleDeleteMessage(msg) : undefined}
+                    onReact={(emoji) => handleReact(msg, emoji)}
+                    onRetry={() => handleRetry(msg)}
+                    onDiscard={() => discard(msg.conversationId, msg.clientMessageId!)}
+                  />
                 );
               })
             )}
@@ -618,6 +718,20 @@ export default function ChatWindow() {
             </div>
           )}
 
+          {(replyTo || editing) && (
+            <div className="px-4 py-2 bg-slate-900/80 border-t border-white/10 flex items-center gap-3 text-xs">
+              <div className="flex-1 min-w-0 border-l-2 border-indigo-400 pl-2">
+                <p className="font-semibold text-indigo-300">
+                  {editing ? "Editing message" : `Replying to ${replyTo!.sender?.name || "message"}`}
+                </p>
+                <p className="text-gray-400 truncate">{previewOf((editing || replyTo)!)}</p>
+              </div>
+              <button onClick={cancelComposerMode} aria-label="Cancel" className="p-1 text-gray-400 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
           {sendError && (
             <div role="alert" className="px-4 py-2 bg-rose-500/10 border-t border-rose-500/30 text-xs text-rose-300">
               {sendError}
@@ -629,11 +743,14 @@ export default function ChatWindow() {
             onSubmit={handleSend}
             className="p-3 border-t border-white/10 bg-slate-950/80 flex items-center gap-2"
           >
-            <label className="p-2.5 rounded-xl text-gray-400 hover:text-indigo-400 hover:bg-white/5 cursor-pointer transition">
+            <label
+              aria-label="Attach a file"
+              className={`p-2.5 rounded-xl text-gray-400 hover:text-indigo-400 hover:bg-white/5 cursor-pointer transition ${editing ? "hidden" : ""}`}
+            >
               <ImageIcon className="w-5 h-5" />
               <input
                 type="file"
-                accept="image/*,application/pdf"
+                accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,application/zip,.doc,.docx,.xls,.xlsx,.ppt,.pptx,audio/*,video/mp4,video/webm"
                 onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
                 className="hidden"
               />
@@ -642,18 +759,21 @@ export default function ChatWindow() {
             <input
               type="text"
               placeholder={
-                isDirectChat
-                  ? "Type an encrypted message..."
-                  : "Type a message to group..."
+                editing ? "Edit your message..." : canEncrypt ? "Type an encrypted message..." : "Type a message..."
               }
+              aria-label="Message"
               value={inputText}
               onChange={handleInputChange}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") cancelComposerMode();
+              }}
               className="flex-1 px-4 py-2.5 rounded-xl glass-input text-xs"
             />
 
             <button
               type="submit"
               disabled={!inputText.trim() && !selectedFile}
+              aria-label={editing ? "Save edit" : "Send message"}
               className="p-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white disabled:bg-gray-800 disabled:text-gray-600 transition shadow-lg shadow-indigo-600/30"
             >
               <Send className="w-5 h-5" />

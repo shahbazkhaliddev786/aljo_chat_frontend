@@ -74,7 +74,10 @@ export default function AudioCallOverlay({ onEndCall }: AudioCallOverlayProps) {
                 </span>
               )}
             </div>
-            <span className="text-xs font-semibold text-white">{p.userName}</span>
+            <span className="text-xs font-semibold text-white">
+              {p.userName}
+              {p.isSpeaking && <span className="sr-only" data-testid="speaking"> is speaking</span>}
+            </span>
           </div>
         ))}
       </div>

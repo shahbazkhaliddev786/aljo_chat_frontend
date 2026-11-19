@@ -21,6 +21,7 @@ export const messageService = {
     iv?: string;
     senderPublicKey?: string;
     recipientPublicKey?: string;
+    keyEnvelopes?: string;
     clientMessageId?: string;
     replyToId?: string;
   }): Promise<IMessage> => {
@@ -34,6 +35,7 @@ export const messageService = {
       iv,
       senderPublicKey,
       recipientPublicKey,
+      keyEnvelopes,
       clientMessageId,
       replyToId,
     } = params;
@@ -49,6 +51,7 @@ export const messageService = {
       if (iv) formData.append("iv", iv);
       if (senderPublicKey) formData.append("senderPublicKey", senderPublicKey);
       if (recipientPublicKey) formData.append("recipientPublicKey", recipientPublicKey);
+      if (keyEnvelopes) formData.append("keyEnvelopes", keyEnvelopes);
       if (clientMessageId) formData.append("clientMessageId", clientMessageId);
 
       const res = await api.post(`/messages/${conversationId}`, formData, {
@@ -65,6 +68,7 @@ export const messageService = {
       iv,
       senderPublicKey,
       recipientPublicKey,
+      keyEnvelopes,
       clientMessageId,
       replyToId,
     });

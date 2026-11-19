@@ -8,6 +8,9 @@ import VideoGrid from "./VideoGrid";
 import AudioCallOverlay from "./AudioCallOverlay";
 import { useQueryClient } from "@tanstack/react-query";
 import { IConversation } from "@/domains/chat/types";
+import { useEffect } from "react";
+import { playRingtone, stopRingtone } from "@/shared/lib/ringtone";
+import { useSpeakingIndicator } from "../hooks/useSpeakingIndicator";
 
 export default function GlobalCallOverlay() {
   const status = useCallStore((s) => s.status);
@@ -15,6 +18,16 @@ export default function GlobalCallOverlay() {
   const notice = useCallStore((s) => s.notice);
   const setActiveConversation = useChatStore((s) => s.setActiveConversation);
   const queryClient = useQueryClient();
+
+  // Ring while being called; ringback while calling someone.
+  useEffect(() => {
+    if (status === "incoming") playRingtone("incoming");
+    else if (status === "calling") playRingtone("outgoing");
+    else stopRingtone();
+    return stopRingtone;
+  }, [status]);
+
+  useSpeakingIndicator(status === "connected");
 
   const noticeToast = notice ? (
     <div

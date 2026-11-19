@@ -25,6 +25,9 @@ export interface IMessage {
   /** Public keys used to derive this message's key (E2EE). */
   senderPublicKey?: string | null;
   recipientPublicKey?: string | null;
+  /** Group E2EE: JSON map of the message key wrapped for each member. */
+  keyEnvelopes?: string | null;
+  editedAt?: string | null;
   /** Client-generated id; lets an optimistic message be matched with the stored one. */
   clientMessageId?: string | null;
   isEdited: boolean;
@@ -38,9 +41,8 @@ export interface IMessage {
     publicKey?: string | null;
   };
   reactions?: Array<{
-    id: string;
     emoji: string;
-    userId: string;
+    userIds: string[];
   }>;
   /** Client-only: set on optimistic messages that are not confirmed by the server yet. */
   localStatus?: "sending" | "failed";
@@ -64,8 +66,10 @@ export interface IConversation {
     content?: string | null;
     type: string;
     isEncrypted?: boolean;
+    isDeleted?: boolean;
     senderId: string;
     createdAt: string;
   } | null;
+  /** Messages from others newer than my read marker (capped at 100). */
   unreadCount?: number;
 }

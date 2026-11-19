@@ -1,6 +1,7 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { getEncryptionMode } from "@/domains/chat/utils/message-crypto";
 import { useQueryClient } from "@tanstack/react-query";
 import { hangUp } from "@/domains/call/services/call.controller";
 import { useCallStore } from "@/shared/stores/call.store";
@@ -15,6 +16,7 @@ import { useSocketStore } from "@/shared/stores/socket.store";
 import { getConversationTitle, getConversationAvatar, isPartnerOnline } from "@/domains/chat/utils/chat.utils";
 import { MessageSquarePlus, Search, LogOut, Users, ShieldCheck } from "lucide-react";
 import { IUser } from "@/domains/user/types";
+import { IConversation } from "@/domains/chat/types";
 
 export default function ChatSidebar() {
   const { data: conversations = [], isLoading } = useConversations();
@@ -25,6 +27,15 @@ export default function ChatSidebar() {
   const currentUser = useAuthStore((s) => s.user);
   const logout = useAuthStore((s) => s.logout);
   const queryClient = useQueryClient();
+
+  // Total unread messages in the browser tab title.
+  const totalUnread = (conversations ?? []).reduce(
+    (sum, c) => sum + (c.id === activeConversation?.id ? 0 : (c.unreadCount ?? 0)),
+    0
+  );
+  useEffect(() => {
+    document.title = totalUnread > 0 ? `(${totalUnread > 99 ? "99+" : totalUnread}) aljo chat` : "aljo chat";
+  }, [totalUnread]);
 
   const handleLogout = () => {
     if (useCallStore.getState().status !== "idle") hangUp();
@@ -172,6 +183,8 @@ export default function ChatSidebar() {
             const title = getConversationTitle(conv, currentUser?.id);
             const avatar = getConversationAvatar(conv, currentUser?.id);
             const online = isPartnerOnline(conv, currentUser?.id, onlineUsers);
+            // The open conversation is being read, so it never shows a badge.
+            const unread = isActive ? 0 : (conv.unreadCount ?? 0);
 
             return (
               <button
@@ -211,22 +224,27 @@ export default function ChatSidebar() {
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center justify-between">
                     <p className="text-xs font-semibold text-white truncate">{title}</p>
-                    {conv.type === "direct" && (
+                    {getEncryptionMode(conv, currentUser?.id).kind !== "none" && (
                       <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
                         E2EE
                       </span>
                     )}
                   </div>
-                  <p className="text-[11px] text-gray-400 truncate mt-0.5">
-                    {conv.latestMessage
-                      ? conv.latestMessage.content ||
-                        (conv.latestMessage.type === "image"
-                          ? "📷 Image"
-                          : conv.latestMessage.type === "file"
-                            ? "📎 File"
-                            : "🔒 Encrypted message")
-                      : "No messages yet"}
-                  </p>
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <p
+                      className={`flex-1 text-[11px] truncate ${unread > 0 ? "text-gray-200 font-semibold" : "text-gray-400"}`}
+                    >
+                      {latestPreview(conv.latestMessage)}
+                    </p>
+                    {unread > 0 && (
+                      <span
+                        aria-label={`${unread >= 100 ? "99+" : unread} unread messages`}
+                        className="shrink-0 min-w-[18px] h-[18px] px-1 rounded-full bg-indigo-500 text-white text-[10px] font-bold flex items-center justify-center"
+                      >
+                        {unread >= 100 ? "99+" : unread}
+                      </span>
+                    )}
+                  </div>
                 </div>
               </button>
             );
@@ -235,4 +253,13 @@ export default function ChatSidebar() {
       </div>
     </div>
   );
+}
+
+function latestPreview(latest: IConversation["latestMessage"]): string {
+  if (!latest) return "No messages yet";
+  if (latest.isDeleted) return "Message deleted";
+  if (latest.content) return latest.content;
+  if (latest.type === "image") return latest.isEncrypted ? "🔒 📷 Photo" : "📷 Photo";
+  if (latest.type === "file") return latest.isEncrypted ? "🔒 📎 File" : "📎 File";
+  return "🔒 Encrypted message";
 }

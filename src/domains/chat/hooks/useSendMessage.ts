@@ -2,7 +2,7 @@
 
 import { useCallback } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useSocketStore } from "@/shared/stores/socket.store";
+import { getConnectedSocket } from "@/shared/stores/socket.store";
 import { useAuthStore } from "@/shared/stores/auth.store";
 import { messageService } from "@/domains/chat/services/message.service";
 import { IMessage } from "@/domains/chat/types";
@@ -19,6 +19,9 @@ export interface OutgoingPayload {
   iv?: string;
   senderPublicKey?: string;
   recipientPublicKey?: string;
+  /** Group E2EE: the message key wrapped for each member. */
+  keyEnvelopes?: string;
+  replyToId?: string;
 }
 
 interface PendingSend {
@@ -50,8 +53,7 @@ export function useSendMessage() {
         if (file) {
           message = await messageService.sendMessage({ conversationId, clientMessageId, file, ...payload });
         } else {
-          const socket = useSocketStore.getState().socket;
-          if (!socket?.connected) throw new Error("offline");
+          const socket = await getConnectedSocket();
           const res = (await socket
             .timeout(SEND_TIMEOUT_MS)
             .emitWithAck("send_message", { conversationId, clientMessageId, ...payload })) as {
@@ -69,6 +71,8 @@ export function useSendMessage() {
       } catch (err) {
         console.error("Failed to send message", err);
         setOptimisticStatus(queryClient, conversationId, clientMessageId, "failed");
+        // Membership may have changed (group keys): refresh members before a retry.
+        queryClient.invalidateQueries({ queryKey: ["conversations"] });
         return null;
       }
     },
@@ -76,7 +80,11 @@ export function useSendMessage() {
   );
 
   const send = useCallback(
-    (conversationId: string, payload: OutgoingPayload, options: { plaintext?: string; file?: File } = {}) => {
+    (
+      conversationId: string,
+      payload: OutgoingPayload,
+      options: { plaintext?: string; file?: File; fileName?: string } = {}
+    ) => {
       const user = useAuthStore.getState().user;
       const clientMessageId = crypto.randomUUID();
       const now = new Date().toISOString();
@@ -95,9 +103,10 @@ export function useSendMessage() {
         createdAt: now,
         updatedAt: now,
         sender: { id: user?.id || "", name: user?.name || "You", avatarUrl: user?.avatarUrl },
+        replyToId: payload.replyToId ?? null,
         localStatus: "sending",
         localPlaintext: options.plaintext,
-        localFileName: options.file?.name,
+        localFileName: options.fileName ?? options.file?.name,
       });
 
       const pending: PendingSend = { conversationId, clientMessageId, payload, ...options };
@@ -107,10 +116,17 @@ export function useSendMessage() {
     [attempt, queryClient]
   );
 
+  /**
+   * Retry a failed send. `freshPayload` lets the caller re-encrypt (e.g. group
+   * membership changed); the clientMessageId is kept, so the message is still
+   * stored at most once.
+   */
   const retry = useCallback(
-    async (clientMessageId: string) => {
+    async (clientMessageId: string, freshPayload?: OutgoingPayload) => {
       const pending = pendingSends.get(clientMessageId);
-      return pending ? attempt(pending) : null;
+      if (!pending) return null;
+      if (freshPayload) pending.payload = freshPayload;
+      return attempt(pending);
     },
     [attempt]
   );

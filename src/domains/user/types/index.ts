@@ -5,7 +5,8 @@ export interface IUser {
   avatarUrl?: string | null;
   bio?: string | null;
   publicKey?: string | null;
-  status: "online" | "offline" | "away";
+  status?: "online" | "offline" | "away";
   lastSeen?: string | null;
+  isVerified?: boolean;
   createdAt?: string;
 }

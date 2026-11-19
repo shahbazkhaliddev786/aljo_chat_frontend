@@ -205,3 +205,123 @@ export async function unwrapPrivateKey(backupJson: string, password: string): Pr
   );
   return new TextDecoder().decode(plaintext);
 }
+
+// ---------------------------------------------------------------------------
+// Group messages: per-message key, wrapped for every member
+//
+// Each group message is encrypted with a fresh random AES-256-GCM key. That key
+// is then wrapped (encrypted) once per member with the pairwise ECDH key
+// between the sender and that member. Membership changes need no key
+// rotation: new members simply receive no envelope for older messages.
+// ---------------------------------------------------------------------------
+
+export interface KeyEnvelope {
+  key: string;
+  iv: string;
+}
+
+async function importRawAesKey(raw: Uint8Array<ArrayBuffer>, usages: KeyUsage[]): Promise<CryptoKey> {
+  return window.crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, usages);
+}
+
+async function aesEncrypt(key: CryptoKey, data: Uint8Array<ArrayBuffer>) {
+  const iv = window.crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = new Uint8Array(await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data));
+  return { ciphertext, iv };
+}
+
+export async function encryptGroupMessage(
+  plainText: string,
+  members: Array<{ id: string; publicKey: string }>,
+  senderPrivateKey: CryptoKey
+): Promise<{ ciphertext: string; iv: string; keyEnvelopes: string }> {
+  const rawKey = window.crypto.getRandomValues(new Uint8Array(32));
+  const contentKey = await importRawAesKey(rawKey, ["encrypt"]);
+  const { ciphertext, iv } = await aesEncrypt(contentKey, new TextEncoder().encode(plainText));
+
+  const envelopes: Record<string, KeyEnvelope> = {};
+  for (const member of members) {
+    const wrappingKey = await deriveSharedAesKey(senderPrivateKey, await importPublicKey(member.publicKey));
+    const wrapped = await aesEncrypt(wrappingKey, rawKey);
+    envelopes[member.id] = { key: toBase64(wrapped.ciphertext), iv: toBase64(wrapped.iv) };
+  }
+
+  return { ciphertext: toBase64(ciphertext), iv: toBase64(iv), keyEnvelopes: JSON.stringify(envelopes) };
+}
+
+export async function decryptGroupMessage(
+  ciphertextBase64: string,
+  ivBase64: string,
+  keyEnvelopesJson: string,
+  myUserId: string,
+  myPrivateKey: CryptoKey,
+  senderPublicKeyJwk: string
+): Promise<string> {
+  const envelope = (JSON.parse(keyEnvelopesJson) as Record<string, KeyEnvelope>)[myUserId];
+  if (!envelope) throw new Error("This message was not encrypted for you");
+
+  const wrappingKey = await deriveSharedAesKey(myPrivateKey, await importPublicKey(senderPublicKeyJwk));
+  const rawKey = new Uint8Array(
+    await window.crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: fromBase64(envelope.iv) },
+      wrappingKey,
+      fromBase64(envelope.key)
+    )
+  );
+  const contentKey = await importRawAesKey(rawKey, ["decrypt"]);
+  const plain = await window.crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: fromBase64(ivBase64) },
+    contentKey,
+    fromBase64(ciphertextBase64)
+  );
+  return new TextDecoder().decode(plain);
+}
+
+// ---------------------------------------------------------------------------
+// Attachments: the file is encrypted with its own random key before upload.
+// The key travels inside the (end-to-end encrypted) message text.
+// ---------------------------------------------------------------------------
+
+export async function encryptFile(file: Blob): Promise<{ blob: Blob; key: string; iv: string }> {
+  const rawKey = window.crypto.getRandomValues(new Uint8Array(32));
+  const key = await importRawAesKey(rawKey, ["encrypt"]);
+  const { ciphertext, iv } = await aesEncrypt(key, new Uint8Array(await file.arrayBuffer()));
+  return { blob: new Blob([ciphertext], { type: "application/octet-stream" }), key: toBase64(rawKey), iv: toBase64(iv) };
+}
+
+export async function decryptFile(data: ArrayBuffer, keyBase64: string, ivBase64: string): Promise<ArrayBuffer> {
+  const key = await importRawAesKey(fromBase64(keyBase64), ["decrypt"]);
+  return window.crypto.subtle.decrypt({ name: "AES-GCM", iv: fromBase64(ivBase64) }, key, data);
+}
+
+// ---------------------------------------------------------------------------
+// Safety numbers: both people see the same 60 digits iff they have each
+// other's real keys (detects a server swapping keys in the middle).
+// ---------------------------------------------------------------------------
+
+const keyMaterial = (jwkString: string) => {
+  const { x, y, crv } = JSON.parse(jwkString) as { x: string; y: string; crv: string };
+  return `${crv}:${x}:${y}`;
+};
+
+export async function computeSafetyNumber(publicKeyA: string, publicKeyB: string): Promise<string> {
+  const [first, second] = [keyMaterial(publicKeyA), keyMaterial(publicKeyB)].sort();
+  const digest = new Uint8Array(
+    await window.crypto.subtle.digest("SHA-256", new TextEncoder().encode(`aljo-safety-v1|${first}|${second}`))
+  );
+  // 12 groups of 5 digits from the first 30 bytes.
+  const groups: string[] = [];
+  for (let i = 0; i < 12; i++) {
+    const chunk = (digest[i * 2] << 16) | (digest[i * 2 + 1] << 8) | digest[24 + (i % 8)];
+    groups.push(String(chunk % 100000).padStart(5, "0"));
+  }
+  return groups.join(" ");
+}
+
+/** Short, stable identifier of one public key (used to notice key changes). */
+export async function keyFingerprint(publicKey: string): Promise<string> {
+  const digest = new Uint8Array(
+    await window.crypto.subtle.digest("SHA-256", new TextEncoder().encode(keyMaterial(publicKey)))
+  );
+  return toBase64(digest).slice(0, 22);
+}

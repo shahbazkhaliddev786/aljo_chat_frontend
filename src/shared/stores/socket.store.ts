@@ -19,10 +19,13 @@ export const useSocketStore = create<SocketState>((set, get) => ({
   onlineUsers: {},
 
   connectSocket: () => {
-    // A socket that is connected or still reconnecting is reused; never run two at once.
+    // Exactly one socket per session: an existing socket (connected, reconnecting,
+    // or stopped after a rejected handshake) is reused, never replaced.
     const existing = get().socket;
-    if (existing?.active) return;
-    existing?.disconnect();
+    if (existing) {
+      if (!existing.active) existing.connect();
+      return;
+    }
 
     const newSocket = io(SOCKET_URL, {
       // Read the latest token on every (re)connect, so renewed tokens are used.
@@ -39,19 +42,32 @@ export const useSocketStore = create<SocketState>((set, get) => ({
     /** Renew the access token, then run `then` with it (or end the session). */
     const renew = (then: (token: string) => void) => {
       refreshSession()
-        .then((token) => (token ? then(token) : expireSession()))
+        .then((token) => {
+          // Ignore if this socket was replaced or closed (e.g. logout) meanwhile.
+          if (get().socket !== newSocket) return;
+          if (token) then(token);
+          else expireSession();
+        })
         .catch(() => setTimeout(() => renew(then), 5_000)); // network error: try again shortly
     };
 
     newSocket.on("disconnect", (reason) => {
       set({ isConnected: false });
       // The server closed the session (token not renewed in time): renew and reconnect.
-      if (reason === "io server disconnect") renew(() => newSocket.connect());
+      if (reason === "io server disconnect") {
+        renew(() => {
+          if (!newSocket.active) newSocket.connect();
+        });
+      }
     });
 
     // Rejected at the handshake (expired token): the client does not retry on its own.
     newSocket.on("connect_error", (err) => {
-      if (err.message.startsWith("Authentication failed")) renew(() => newSocket.connect());
+      if (err.message.startsWith("Authentication failed")) {
+        renew(() => {
+          if (!newSocket.active) newSocket.connect();
+        });
+      }
     });
 
     // The access token expired during a long session: renew it in-band so calls keep going.
@@ -87,3 +103,31 @@ export const useSocketStore = create<SocketState>((set, get) => ({
     }));
   },
 }));
+
+/**
+ * The connected socket, waiting up to `timeoutMs` for a reconnect that is in
+ * progress (e.g. right after the server restarted). Throws "offline" otherwise.
+ */
+export async function getConnectedSocket(timeoutMs = 5_000): Promise<Socket> {
+  const socket = useSocketStore.getState().socket;
+  if (!socket) throw new Error("offline");
+  if (socket.connected) return socket;
+  if (!socket.active) throw new Error("offline");
+
+  // The user is acting now: try to reconnect immediately instead of waiting out
+  // socket.io's exponential backoff (which can be several seconds after an outage).
+  socket.disconnect().connect();
+
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.off("connect", onConnect);
+      reject(new Error("offline"));
+    }, timeoutMs);
+    const onConnect = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    socket.once("connect", onConnect);
+  });
+  return socket;
+}

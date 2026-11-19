@@ -67,3 +67,21 @@ export function prependOlderMessages(queryClient: QueryClient, conversationId: s
     return [...older.filter((m) => !known.has(m.id)), ...old];
   });
 }
+
+/** Apply an edited/deleted message from the server (replaces the cached copy). */
+export function replaceMessage(queryClient: QueryClient, message: IMessage) {
+  queryClient.setQueryData<IMessage[]>(messagesKey(message.conversationId), (old) =>
+    old?.map((m) => (m.id === message.id ? { ...m, ...message } : m))
+  );
+}
+
+export function setMessageReactions(
+  queryClient: QueryClient,
+  conversationId: string,
+  messageId: string,
+  reactions: IMessage["reactions"]
+) {
+  queryClient.setQueryData<IMessage[]>(messagesKey(conversationId), (old) =>
+    old?.map((m) => (m.id === messageId ? { ...m, reactions } : m))
+  );
+}
