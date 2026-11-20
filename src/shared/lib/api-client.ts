@@ -1,6 +1,8 @@
-import axios from "axios";
+import axios, { AxiosError, InternalAxiosRequestConfig } from "axios";
+import { API_BASE_URL } from "@/shared/lib/config";
+import { getAccessToken, refreshSession, expireSession } from "@/shared/lib/auth-session";
 
-export const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api/v1";
+export { API_BASE_URL };
 
 export const api = axios.create({
   baseURL: API_BASE_URL,
@@ -10,24 +12,33 @@ export const api = axios.create({
 });
 
 api.interceptors.request.use((config) => {
-  if (typeof window !== "undefined") {
-    const token = localStorage.getItem("aljo_chat_token");
-    if (token) {
-      config.headers.Authorization = `Bearer ${token}`;
-    }
-  }
+  const token = getAccessToken();
+  if (token) config.headers.Authorization = `Bearer ${token}`;
   return config;
 });
 
+// Requests whose 401 means "wrong credentials", not "expired session".
+const AUTH_ENDPOINTS = ["/auth/login", "/auth/register", "/auth/refresh-token"];
+
 api.interceptors.response.use(
   (response) => response,
-  (error) => {
-    if (error.response?.status === 401 && typeof window !== "undefined") {
-      localStorage.removeItem("aljo_chat_token");
-      localStorage.removeItem("aljo_chat_user");
-      if (!window.location.pathname.startsWith("/login")) {
-        window.location.href = "/login";
+  async (error: AxiosError) => {
+    const original = error.config as (InternalAxiosRequestConfig & { _retried?: boolean }) | undefined;
+    const isAuthEndpoint = AUTH_ENDPOINTS.some((path) => original?.url?.startsWith(path));
+
+    if (error.response?.status === 401 && original && !original._retried && !isAuthEndpoint) {
+      original._retried = true;
+      let token: string | null;
+      try {
+        token = await refreshSession();
+      } catch {
+        return Promise.reject(error); // network problem: keep the session, surface the error
       }
+      if (token) {
+        original.headers.Authorization = `Bearer ${token}`;
+        return api(original);
+      }
+      expireSession();
     }
     return Promise.reject(error);
   }

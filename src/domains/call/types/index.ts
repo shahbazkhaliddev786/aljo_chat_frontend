@@ -4,17 +4,11 @@ export type CallType = "audio" | "video";
 export type CallStatus = "idle" | "calling" | "incoming" | "connected";
 export type CallMode = "direct" | "group";
 
-export interface DirectCallInvite {
-  conversationId: string;
-  targetUserId: string;
-  callType: CallType;
-}
-
 export interface IncomingCallEvent {
+  callId: string;
   callerUserId: string;
   callerName: string;
   callerAvatar?: string | null;
-  callerSocketId: string;
   conversationId: string;
   callType: CallType;
 }

@@ -11,7 +11,7 @@ import { Lock, Mail, ArrowRight, AlertCircle, Sparkles } from "lucide-react";
 export default function LoginPage() {
   const router = useRouter();
   const setAuth = useAuthStore((s) => s.setAuth);
-  const initializeCrypto = useCryptoStore((s) => s.initializeCrypto);
+  const setupKeys = useCryptoStore((s) => s.setupKeys);
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -24,15 +24,18 @@ export default function LoginPage() {
     setIsLoading(true);
 
     try {
-      const { user, accessToken } = await authService.login({ email, password });
-      setAuth(user, accessToken);
+      const { user, accessToken, refreshToken } = await authService.login({ email, password });
+      setAuth(user, accessToken, refreshToken);
 
-      // Initialize E2EE Keypair & publish public key
+      // Restore (or create) this account's E2EE key pair. Without it, encrypted
+      // chats cannot be read, so a failure here is surfaced instead of ignored.
       try {
-        const pubKeyJwk = await initializeCrypto();
-        await authService.publishPublicKey(pubKeyJwk);
+        await setupKeys(user.id, password);
       } catch (cryptoErr) {
-        console.error("Crypto init error:", cryptoErr);
+        console.error("Crypto setup error:", cryptoErr);
+        useAuthStore.getState().logout();
+        setErrorMsg("Signed in, but your encryption keys could not be set up. Please try again.");
+        return;
       }
 
       router.push("/chat");

@@ -1,97 +1,96 @@
-import { Socket } from "socket.io-client";
+/**
+ * One RTCPeerConnection for a 1-on-1 call.
+ *
+ * Signaling is delegated to the caller through `sendSignal`, which addresses the
+ * server-side call by id (the server relays to the other participant).
+ *
+ * Remote ICE candidates that arrive before the remote description is set are
+ * queued and applied afterwards — otherwise they are rejected by the browser
+ * and connectivity becomes intermittent.
+ */
 
-const ICE_SERVERS: RTCConfiguration = {
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-  ],
-};
+type Signal =
+  | { type: "offer"; sdp: RTCSessionDescriptionInit }
+  | { type: "answer"; sdp: RTCSessionDescriptionInit }
+  | { type: "candidate"; candidate: RTCIceCandidateInit };
+
+interface P2POptions {
+  iceServers: RTCIceServer[];
+  sendSignal: (signal: Signal) => void;
+  onRemoteStream: (stream: MediaStream) => void;
+  onConnectionStateChange?: (state: RTCPeerConnectionState) => void;
+}
 
 export class WebRTCP2PService {
-  private pc: RTCPeerConnection | null = null;
-  private socket: Socket;
-  private onRemoteTrackCallback?: (stream: MediaStream) => void;
+  private pc: RTCPeerConnection;
+  private pendingCandidates: RTCIceCandidateInit[] = [];
+  private remoteStream = new MediaStream();
+  private closed = false;
 
-  constructor(socket: Socket) {
-    this.socket = socket;
-  }
-
-  public initPeerConnection(
-    targetSocketId: string,
-    onRemoteTrack: (stream: MediaStream) => void
-  ): RTCPeerConnection {
-    this.cleanup();
-
-    this.onRemoteTrackCallback = onRemoteTrack;
-    this.pc = new RTCPeerConnection(ICE_SERVERS);
-
-    const remoteStream = new MediaStream();
+  constructor(private options: P2POptions) {
+    this.pc = new RTCPeerConnection({ iceServers: options.iceServers });
 
     this.pc.ontrack = (event) => {
-      event.streams[0]?.getTracks().forEach((track) => {
-        remoteStream.addTrack(track);
+      const tracks = event.streams[0]?.getTracks() ?? [event.track];
+      tracks.forEach((track) => {
+        if (!this.remoteStream.getTracks().some((t) => t.id === track.id)) {
+          this.remoteStream.addTrack(track);
+        }
       });
-      if (this.onRemoteTrackCallback) {
-        this.onRemoteTrackCallback(remoteStream);
-      }
+      this.options.onRemoteStream(this.remoteStream);
     };
 
     this.pc.onicecandidate = (event) => {
       if (event.candidate) {
-        this.socket.emit("ice:candidate", {
-          targetSocketId,
-          candidate: event.candidate,
-        });
+        this.options.sendSignal({ type: "candidate", candidate: event.candidate.toJSON() });
       }
     };
 
-    return this.pc;
+    this.pc.onconnectionstatechange = () => {
+      this.options.onConnectionStateChange?.(this.pc.connectionState);
+    };
   }
 
   public addLocalStream(stream: MediaStream) {
-    if (!this.pc) return;
-    stream.getTracks().forEach((track) => {
-      this.pc?.addTrack(track, stream);
-    });
+    stream.getTracks().forEach((track) => this.pc.addTrack(track, stream));
   }
 
-  public async createOffer(targetSocketId: string): Promise<RTCSessionDescriptionInit> {
-    if (!this.pc) throw new Error("PeerConnection not initialized");
+  /** Caller side: create and send the offer. */
+  public async createOffer() {
     const offer = await this.pc.createOffer();
     await this.pc.setLocalDescription(offer);
-
-    this.socket.emit("call:offer", {
-      targetSocketId,
-      sdp: offer,
-    });
-
-    return offer;
+    this.options.sendSignal({ type: "offer", sdp: offer });
   }
 
-  public async handleOffer(
-    senderSocketId: string,
-    offer: RTCSessionDescriptionInit
-  ): Promise<RTCSessionDescriptionInit> {
-    if (!this.pc) throw new Error("PeerConnection not initialized");
+  /** Caller side: renegotiate with fresh ICE credentials after the connection failed. */
+  public async restartIce() {
+    if (this.closed) return;
+    const offer = await this.pc.createOffer({ iceRestart: true });
+    await this.pc.setLocalDescription(offer);
+    this.options.sendSignal({ type: "offer", sdp: offer });
+  }
+
+  /** Callee side: apply the offer (initial or ICE restart) and send back an answer. */
+  public async handleOffer(offer: RTCSessionDescriptionInit) {
     await this.pc.setRemoteDescription(new RTCSessionDescription(offer));
+    await this.flushPendingCandidates();
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
-
-    this.socket.emit("call:answer", {
-      targetSocketId: senderSocketId,
-      sdp: answer,
-    });
-
-    return answer;
+    this.options.sendSignal({ type: "answer", sdp: answer });
   }
 
+  /** Caller side: apply the answer. */
   public async handleAnswer(answer: RTCSessionDescriptionInit) {
-    if (!this.pc) return;
     await this.pc.setRemoteDescription(new RTCSessionDescription(answer));
+    await this.flushPendingCandidates();
   }
 
-  public async handleIceCandidate(candidate: RTCIceCandidateInit) {
-    if (!this.pc) return;
+  public async addIceCandidate(candidate: RTCIceCandidateInit) {
+    if (this.closed) return;
+    if (!this.pc.remoteDescription) {
+      this.pendingCandidates.push(candidate);
+      return;
+    }
     try {
       await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
     } catch (err) {
@@ -99,12 +98,21 @@ export class WebRTCP2PService {
     }
   }
 
-  public cleanup() {
-    if (this.pc) {
-      this.pc.ontrack = null;
-      this.pc.onicecandidate = null;
-      this.pc.close();
-      this.pc = null;
+  private async flushPendingCandidates() {
+    const queued = this.pendingCandidates;
+    this.pendingCandidates = [];
+    for (const candidate of queued) {
+      await this.addIceCandidate(candidate);
     }
+  }
+
+  public close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.pendingCandidates = [];
+    this.pc.ontrack = null;
+    this.pc.onicecandidate = null;
+    this.pc.onconnectionstatechange = null;
+    this.pc.close();
   }
 }

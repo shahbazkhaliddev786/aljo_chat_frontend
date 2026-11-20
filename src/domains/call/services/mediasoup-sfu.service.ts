@@ -1,214 +1,219 @@
 import { Device, types } from "mediasoup-client";
 import { Socket } from "socket.io-client";
 
-interface RouterCapabilitiesResponse {
-  error?: string;
-  rtpCapabilities?: types.RtpCapabilities;
+const REQUEST_TIMEOUT_MS = 10_000;
+
+export interface RemoteProducerInfo {
+  producerId: string;
+  socketId: string;
+  userId: string;
+  userName: string;
 }
 
-interface TransportParamsResponse {
-  error?: string;
-  transportParams?: types.TransportOptions;
+export interface RemotePeerState {
+  socketId: string;
+  userId: string;
+  userName: string;
+  audio: boolean;
+  video: boolean;
 }
 
-interface ConnectTransportResponse {
-  error?: string;
+export interface ConsumedTrack {
+  consumer: types.Consumer;
+  track: MediaStreamTrack;
+  producerId: string;
+  socketId: string;
+  userId: string;
+  userName: string;
 }
 
-interface ProduceResponse {
-  error?: string;
-  id?: string;
+interface ConsumerData {
+  id: string;
+  producerId: string;
+  kind: "audio" | "video";
+  rtpParameters: types.RtpParameters;
+  producerUserId: string;
+  producerUserName: string;
+  producerSocketId: string;
 }
 
-interface ConsumeResponse {
-  error?: string;
-  consumerData?: {
-    id: string;
-    producerId: string;
-    kind: "audio" | "video";
-    rtpParameters: types.RtpParameters;
-    producerUserId: string;
-    producerUserName: string;
-  };
-}
-
+/**
+ * Client side of one group call on the mediasoup SFU.
+ *
+ * Lifecycle: join() → start(stream) → consume()… → close().
+ * Every request is scoped to the conversation; the server additionally scopes
+ * transports/producers/consumers to this socket.
+ */
 export class MediasoupSFUService {
-  private device: Device | null = null;
+  private device = new Device();
   private sendTransport: types.Transport | null = null;
   private recvTransport: types.Transport | null = null;
-  private producers: Map<string, types.Producer> = new Map();
-  private consumers: Map<string, types.Consumer> = new Map();
-  private socket: Socket;
+  private producers: types.Producer[] = [];
+  private consumers = new Map<string, { consumer: types.Consumer; socketId: string }>(); // by producerId
+  private pendingConsumes = new Set<string>();
+  private closed = false;
 
-  constructor(socket: Socket) {
-    this.socket = socket;
+  constructor(
+    private socket: Socket,
+    private conversationId: string,
+    private iceServers: RTCIceServer[],
+    /** Called once if a media transport fails for good (network lost). */
+    private onConnectionFailed?: () => void
+  ) {}
+
+  private async request<T>(event: string, payload: Record<string, unknown> = {}): Promise<T> {
+    const res = (await this.socket
+      .timeout(REQUEST_TIMEOUT_MS)
+      .emitWithAck(event, { conversationId: this.conversationId, ...payload })) as T & { error?: string };
+    if (res?.error) throw new Error(res.error);
+    return res;
   }
 
-  public async initDevice(conversationId: string): Promise<Device> {
-    if (this.device && this.device.loaded) return this.device;
+  public get isClosed() {
+    return this.closed;
+  }
 
-    this.device = new Device();
+  /** Whether transports are ready so remote producers can be consumed. */
+  public get isReady() {
+    return !!this.recvTransport && !this.closed;
+  }
 
-    const { rtpCapabilities } = await new Promise<{ rtpCapabilities: types.RtpCapabilities }>((resolve, reject) => {
-      this.socket.emit("sfu:get-router-rtp-capabilities", { conversationId }, (res: RouterCapabilitiesResponse) => {
-        if (res.error) reject(new Error(res.error));
-        else if (res.rtpCapabilities) resolve({ rtpCapabilities: res.rtpCapabilities });
-        else reject(new Error("No capabilities returned"));
-      });
-    });
-
+  /** Join the call (membership is checked server-side) and load the device. */
+  public async join() {
+    const { rtpCapabilities } = await this.request<{ rtpCapabilities: types.RtpCapabilities }>("sfu:join-room");
     await this.device.load({ routerRtpCapabilities: rtpCapabilities });
-    return this.device;
   }
 
-  public async createSendTransport(conversationId: string): Promise<types.Transport> {
-    if (!this.device) throw new Error("Device not initialized");
-
-    const { transportParams } = await new Promise<{ transportParams: types.TransportOptions }>((resolve, reject) => {
-      this.socket.emit("sfu:create-transport", { conversationId }, (res: TransportParamsResponse) => {
-        if (res.error) reject(new Error(res.error));
-        else if (res.transportParams) resolve({ transportParams: res.transportParams });
-        else reject(new Error("No transport params returned"));
-      });
-    });
-
-    this.sendTransport = this.device.createSendTransport(transportParams);
-
-    this.sendTransport.on("connect", ({ dtlsParameters }: { dtlsParameters: types.DtlsParameters }, callback: () => void, errback: (err: Error) => void) => {
-      this.socket.emit(
-        "sfu:connect-transport",
-        { conversationId, transportId: this.sendTransport!.id, dtlsParameters },
-        (res: ConnectTransportResponse) => {
-          if (res.error) errback(new Error(res.error));
-          else callback();
-        }
-      );
-    });
-
-    this.sendTransport.on(
-      "produce",
-      ({ kind, rtpParameters }: { kind: types.MediaKind; rtpParameters: types.RtpParameters }, callback: (data: { id: string }) => void, errback: (err: Error) => void) => {
-        this.socket.emit(
-          "sfu:produce",
-          { conversationId, transportId: this.sendTransport!.id, kind, rtpParameters },
-          (res: ProduceResponse) => {
-            if (res.error) errback(new Error(res.error));
-            else if (res.id) callback({ id: res.id });
-            else errback(new Error("No producer ID returned"));
-          }
-        );
-      }
+  private async createTransport(direction: "send" | "recv"): Promise<types.Transport> {
+    const { transportParams } = await this.request<{ transportParams: types.TransportOptions }>(
+      "sfu:create-transport"
     );
+    const options = { ...transportParams, iceServers: this.iceServers };
+    const transport =
+      direction === "send" ? this.device.createSendTransport(options) : this.device.createRecvTransport(options);
 
-    return this.sendTransport;
-  }
+    transport.on("connectionstatechange", (state) => {
+      if (state === "failed" && !this.closed) this.onConnectionFailed?.();
+    });
 
-  public async createRecvTransport(conversationId: string): Promise<types.Transport> {
-    if (!this.device) throw new Error("Device not initialized");
+    transport.on("connect", ({ dtlsParameters }, callback, errback) => {
+      this.request("sfu:connect-transport", { transportId: transport.id, dtlsParameters })
+        .then(() => callback())
+        .catch(errback);
+    });
 
-    const { transportParams } = await new Promise<{ transportParams: types.TransportOptions }>((resolve, reject) => {
-      this.socket.emit("sfu:create-transport", { conversationId }, (res: TransportParamsResponse) => {
-        if (res.error) reject(new Error(res.error));
-        else if (res.transportParams) resolve({ transportParams: res.transportParams });
-        else reject(new Error("No transport params returned"));
+    if (direction === "send") {
+      transport.on("produce", ({ kind, rtpParameters }, callback, errback) => {
+        this.request<{ id: string }>("sfu:produce", { transportId: transport.id, kind, rtpParameters })
+          .then(({ id }) => callback({ id }))
+          .catch(errback);
       });
-    });
+    }
 
-    this.recvTransport = this.device.createRecvTransport(transportParams);
-
-    this.recvTransport.on("connect", ({ dtlsParameters }: { dtlsParameters: types.DtlsParameters }, callback: () => void, errback: (err: Error) => void) => {
-      this.socket.emit(
-        "sfu:connect-transport",
-        { conversationId, transportId: this.recvTransport!.id, dtlsParameters },
-        (res: ConnectTransportResponse) => {
-          if (res.error) errback(new Error(res.error));
-          else callback();
-        }
-      );
-    });
-
-    return this.recvTransport;
+    return transport;
   }
 
-  public async produceTrack(track: MediaStreamTrack): Promise<types.Producer> {
-    if (!this.sendTransport) throw new Error("Send transport not created");
-    const producer = await this.sendTransport.produce({ track });
-    this.producers.set(track.kind, producer);
-    return producer;
+  /** Create both transports and publish the local tracks. */
+  public async start(localStream: MediaStream) {
+    this.sendTransport = await this.createTransport("send");
+    this.recvTransport = await this.createTransport("recv");
+
+    for (const track of localStream.getTracks()) {
+      if (this.closed) return;
+      this.producers.push(await this.sendTransport.produce({ track }));
+    }
   }
 
-  public async consumeProducer(
-    conversationId: string,
-    producerId: string
-  ): Promise<{ consumer: types.Consumer; stream: MediaStream; producerUserId: string; producerUserName: string }> {
-    if (!this.recvTransport || !this.device) throw new Error("Recv transport not initialized");
+  /** Producers and mic/camera state of the other participants already in the call. */
+  public async getExisting(): Promise<{ producers: RemoteProducerInfo[]; peers: RemotePeerState[] }> {
+    const { producers, peers } = await this.request<{ producers: RemoteProducerInfo[]; peers?: RemotePeerState[] }>(
+      "sfu:get-producers"
+    );
+    return { producers, peers: peers ?? [] };
+  }
 
-    const { consumerData } = await new Promise<{
-      consumerData: {
-        id: string;
-        producerId: string;
-        kind: "audio" | "video";
-        rtpParameters: types.RtpParameters;
-        producerUserId: string;
-        producerUserName: string;
-      };
-    }>((resolve, reject) => {
-      this.socket.emit(
-        "sfu:consume",
-        {
-          conversationId,
-          transportId: this.recvTransport!.id,
-          producerId,
-          rtpCapabilities: this.device!.rtpCapabilities,
-        },
-        (res: ConsumeResponse) => {
-          if (res.error) reject(new Error(res.error));
-          else if (res.consumerData) resolve({ consumerData: res.consumerData });
-          else reject(new Error("No consumer data returned"));
-        }
-      );
+  /** Stop/start sending a kind of media (saves bandwidth while muted / camera off). */
+  public setPaused(kind: "audio" | "video", paused: boolean) {
+    this.producers
+      .filter((p) => p.kind === kind && !p.closed)
+      .forEach((p) => (paused ? p.pause() : p.resume()));
+  }
+
+  /** Tell the other participants whether our mic/camera are on. */
+  public sendMediaState(state: { audio: boolean; video: boolean }) {
+    if (this.closed) return;
+    this.socket.emit("sfu:media-state", { conversationId: this.conversationId, ...state });
+  }
+
+  /** Consume a remote producer. Returns null if it is already being consumed. */
+  public async consume(producerId: string): Promise<ConsumedTrack | null> {
+    if (!this.recvTransport) throw new Error("Receive transport not ready");
+    if (this.consumers.has(producerId) || this.pendingConsumes.has(producerId)) return null;
+
+    this.pendingConsumes.add(producerId);
+    try {
+      return await this.consumeOnce(producerId, this.recvTransport);
+    } finally {
+      this.pendingConsumes.delete(producerId);
+    }
+  }
+
+  private async consumeOnce(producerId: string, recvTransport: types.Transport): Promise<ConsumedTrack | null> {
+    const { consumerData } = await this.request<{ consumerData: ConsumerData }>("sfu:consume", {
+      transportId: recvTransport.id,
+      producerId,
+      rtpCapabilities: this.device.rtpCapabilities,
     });
 
-    const consumer = await this.recvTransport.consume({
+    if (this.closed) return null;
+
+    const consumer = await recvTransport.consume({
       id: consumerData.id,
       producerId: consumerData.producerId,
       kind: consumerData.kind,
       rtpParameters: consumerData.rtpParameters,
     });
+    this.consumers.set(producerId, { consumer, socketId: consumerData.producerSocketId });
+    consumer.on("transportclose", () => this.consumers.delete(producerId));
 
-    this.consumers.set(consumer.id, consumer);
-
-    const stream = new MediaStream([consumer.track]);
+    // The server creates consumers paused; resuming once we are ready makes it
+    // request a fresh keyframe, so video starts immediately instead of black.
+    await this.request("sfu:resume-consumer", { consumerId: consumer.id });
 
     return {
       consumer,
-      stream,
-      producerUserId: consumerData.producerUserId,
-      producerUserName: consumerData.producerUserName,
+      track: consumer.track,
+      producerId,
+      socketId: consumerData.producerSocketId,
+      userId: consumerData.producerUserId,
+      userName: consumerData.producerUserName,
     };
   }
 
-  public cleanup(conversationId?: string) {
-    if (conversationId && this.socket) {
-      this.socket.emit("sfu:leave-room", { conversationId });
+  /** Release the consumers of a participant who left (the server already closed its side). */
+  public removeParticipant(socketId: string) {
+    for (const [producerId, entry] of this.consumers) {
+      if (entry.socketId === socketId) {
+        entry.consumer.close();
+        this.consumers.delete(producerId);
+      }
     }
+  }
+
+  /** Leave the call and release every local media object. */
+  public close() {
+    if (this.closed) return;
+    this.closed = true;
+
+    this.socket.emit("sfu:leave-room", { conversationId: this.conversationId });
 
     this.producers.forEach((p) => p.close());
-    this.producers.clear();
-
-    this.consumers.forEach((c) => c.close());
+    this.producers = [];
+    this.consumers.forEach(({ consumer }) => consumer.close());
     this.consumers.clear();
-
-    if (this.sendTransport) {
-      this.sendTransport.close();
-      this.sendTransport = null;
-    }
-
-    if (this.recvTransport) {
-      this.recvTransport.close();
-      this.recvTransport = null;
-    }
-
-    this.device = null;
+    this.sendTransport?.close();
+    this.recvTransport?.close();
+    this.sendTransport = null;
+    this.recvTransport = null;
   }
 }
