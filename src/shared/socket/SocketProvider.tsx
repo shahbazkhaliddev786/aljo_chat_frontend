@@ -1,12 +1,16 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useAuthStore } from "@/shared/stores/auth.store";
 import { useSocketStore } from "@/shared/stores/socket.store";
 import { useChatStore } from "@/shared/stores/chat.store";
-import { useCallStore } from "@/shared/stores/call.store";
 import { useQueryClient } from "@tanstack/react-query";
-import { IMessage } from "@/domains/chat/types";
+import { IMessage, IConversation } from "@/domains/chat/types";
+import { upsertMessage, replaceMessage, setMessageReactions } from "@/domains/chat/utils/message-cache";
+
+// A typing indicator disappears on its own if the "stop" event never arrives
+// (e.g. the other user lost their connection mid-sentence).
+const TYPING_EXPIRY_MS = 6_000;
 
 export default function SocketProvider({ children }: { children: React.ReactNode }) {
   const token = useAuthStore((s) => s.token);
@@ -17,13 +21,12 @@ export default function SocketProvider({ children }: { children: React.ReactNode
   const removeTypingUser = useChatStore((s) => s.removeTypingUser);
   const setActiveConversation = useChatStore((s) => s.setActiveConversation);
   const activeConversationId = useChatStore((s) => s.activeConversationId);
-  const setIncomingCall = useCallStore((s) => s.setIncomingCall);
-  const endCall = useCallStore((s) => s.endCall);
   const queryClient = useQueryClient();
+  const typingTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
   useEffect(() => {
     if (isAuthenticated && token) {
-      connectSocket(token);
+      connectSocket();
     } else {
       disconnectSocket();
     }
@@ -33,10 +36,60 @@ export default function SocketProvider({ children }: { children: React.ReactNode
     if (!socket) return;
 
     const handleReceiveMessage = (message: IMessage) => {
-      queryClient.setQueryData<IMessage[]>(["messages", message.conversationId], (old = []) => {
-        if (old.some((m) => m.id === message.id)) return old;
-        return [...old, message];
-      });
+      upsertMessage(queryClient, message);
+      queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    };
+
+    // After a (re)connect, fetch whatever was missed while offline.
+    const handleConnect = () => {
+      queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      queryClient.invalidateQueries({ queryKey: ["messages"] });
+    };
+
+    // Someone read messages: move their read marker in the cached conversation.
+    const handleMessageRead = ({
+      conversationId,
+      userId,
+      messageId,
+    }: {
+      conversationId: string;
+      userId: string;
+      messageId: string;
+    }) => {
+      queryClient.setQueryData<IConversation[]>(["conversations"], (old) =>
+        old?.map((c) =>
+          c.id !== conversationId
+            ? c
+            : {
+                ...c,
+                // We only ever mark the newest message as read, so our own unread count is now 0.
+                ...(userId === currentUser?.id ? { unreadCount: 0 } : {}),
+                members: c.members.map((m) => (m.id === userId ? { ...m, lastReadMessageId: messageId } : m)),
+              }
+        )
+      );
+    };
+
+    // A message was edited or deleted.
+    const handleMessageUpdated = (message: IMessage) => {
+      replaceMessage(queryClient, message);
+      queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    };
+
+    const handleMessageReactions = ({
+      conversationId,
+      messageId,
+      reactions,
+    }: {
+      conversationId: string;
+      messageId: string;
+      reactions: IMessage["reactions"];
+    }) => {
+      setMessageReactions(queryClient, conversationId, messageId, reactions);
+    };
+
+    // A contact published (or changed) their encryption key.
+    const handleUserKeyUpdated = () => {
       queryClient.invalidateQueries({ queryKey: ["conversations"] });
     };
 
@@ -72,66 +125,38 @@ export default function SocketProvider({ children }: { children: React.ReactNode
       queryClient.invalidateQueries({ queryKey: ["messages", conversationId] });
     };
 
+    const timers = typingTimers.current;
+    const clearTypingTimer = (key: string) => {
+      const timer = timers.get(key);
+      if (timer) clearTimeout(timer);
+      timers.delete(key);
+    };
+
     const handleTypingStart = ({ conversationId, userName }: { conversationId: string; userName: string }) => {
+      const key = `${conversationId}:${userName}`;
       setTypingUser(conversationId, userName);
+      clearTypingTimer(key);
+      timers.set(
+        key,
+        setTimeout(() => {
+          timers.delete(key);
+          removeTypingUser(conversationId, userName);
+        }, TYPING_EXPIRY_MS)
+      );
     };
 
     const handleTypingStop = ({ conversationId, userName }: { conversationId: string; userName: string }) => {
+      clearTypingTimer(`${conversationId}:${userName}`);
       removeTypingUser(conversationId, userName);
     };
 
-    const handleIncomingCall = (data: {
-      callerUserId: string;
-      callerName: string;
-      callerAvatar?: string | null;
-      callerSocketId: string;
-      conversationId: string;
-      callType: "audio" | "video";
-    }) => {
-      setIncomingCall({
-        conversationId: data.conversationId,
-        targetUserId: data.callerUserId,
-        targetUserName: data.callerName,
-        targetUserAvatar: data.callerAvatar,
-        callType: data.callType,
-        mode: "direct",
-        callerSocketId: data.callerSocketId,
-      });
-    };
+    // Call events are handled by the call controller (see CallProvider).
 
-    const handleCallEnded = () => {
-      endCall();
-    };
-
-    const handleGroupCallStarted = (data: {
-      conversationId: string;
-      callType: "audio" | "video";
-      callerUserId: string;
-      callerName: string;
-      callerAvatar?: string | null;
-    }) => {
-      // Don't show notification if already in a call
-      const currentStatus = useCallStore.getState().status;
-      if (currentStatus !== "idle") return;
-
-      setIncomingCall({
-        conversationId: data.conversationId,
-        targetUserId: data.callerUserId,
-        targetUserName: data.callerName,
-        targetUserAvatar: data.callerAvatar,
-        callType: data.callType,
-        mode: "group",
-      });
-    };
-
-    const handleGroupCallEnded = ({ conversationId }: { conversationId: string }) => {
-      const state = useCallStore.getState();
-      // Only dismiss if we're showing an incoming notification for this conversation
-      if (state.status === "incoming" && state.activeCall?.conversationId === conversationId) {
-        endCall();
-      }
-    };
-
+    socket.on("connect", handleConnect);
+    socket.on("message_read", handleMessageRead);
+    socket.on("message_updated", handleMessageUpdated);
+    socket.on("message_reactions", handleMessageReactions);
+    socket.on("user_key_updated", handleUserKeyUpdated);
     socket.on("receive_message", handleReceiveMessage);
     socket.on("group_deleted", handleConversationDeleted);
     socket.on("conversation_deleted", handleConversationDeleted);
@@ -140,12 +165,13 @@ export default function SocketProvider({ children }: { children: React.ReactNode
     socket.on("member_removed_from_group", handleMemberRemovedFromGroup);
     socket.on("typing_start", handleTypingStart);
     socket.on("typing_stop", handleTypingStop);
-    socket.on("call:incoming", handleIncomingCall);
-    socket.on("call:ended", handleCallEnded);
-    socket.on("group:call:started", handleGroupCallStarted);
-    socket.on("group:call:ended", handleGroupCallEnded);
 
     return () => {
+      socket.off("connect", handleConnect);
+      socket.off("message_read", handleMessageRead);
+      socket.off("message_updated", handleMessageUpdated);
+      socket.off("message_reactions", handleMessageReactions);
+      socket.off("user_key_updated", handleUserKeyUpdated);
       socket.off("receive_message", handleReceiveMessage);
       socket.off("group_deleted", handleConversationDeleted);
       socket.off("conversation_deleted", handleConversationDeleted);
@@ -154,10 +180,6 @@ export default function SocketProvider({ children }: { children: React.ReactNode
       socket.off("member_removed_from_group", handleMemberRemovedFromGroup);
       socket.off("typing_start", handleTypingStart);
       socket.off("typing_stop", handleTypingStop);
-      socket.off("call:incoming", handleIncomingCall);
-      socket.off("call:ended", handleCallEnded);
-      socket.off("group:call:started", handleGroupCallStarted);
-      socket.off("group:call:ended", handleGroupCallEnded);
     };
   }, [
     socket,
@@ -167,8 +189,6 @@ export default function SocketProvider({ children }: { children: React.ReactNode
     setActiveConversation,
     activeConversationId,
     currentUser,
-    setIncomingCall,
-    endCall,
   ]);
 
   return <>{children}</>;

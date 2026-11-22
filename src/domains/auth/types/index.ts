@@ -22,4 +22,5 @@ export interface AuthResponse {
     createdAt?: string;
   };
   accessToken: string;
+  refreshToken: string;
 }

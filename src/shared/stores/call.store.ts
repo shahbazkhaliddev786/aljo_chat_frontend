@@ -1,27 +1,33 @@
 import { create } from "zustand";
 
 export type CallType = "audio" | "video";
-export type CallStatus = "idle" | "calling" | "incoming" | "connected";
+/**
+ * idle → calling (ringing the other side) / incoming (we are being rung)
+ *      → connecting (answered; media not flowing yet, or reconnecting)
+ *      → connected (media is flowing)
+ */
+export type CallStatus = "idle" | "calling" | "incoming" | "connecting" | "connected";
 export type CallMode = "direct" | "group";
 
 export interface ActiveCallInfo {
   conversationId: string;
+  /** Server-side id of a 1-on-1 call (absent for group calls and until the server acknowledges the invite). */
+  callId?: string;
   targetUserId?: string;
   targetUserName?: string;
   targetUserAvatar?: string | null;
   callType: CallType;
   mode: CallMode;
-  callerSocketId?: string;
+  isInitiator?: boolean;
 }
 
 export interface RemoteParticipant {
+  /** Stable key: the remote socket id (group) or "peer" (1-on-1). */
   socketId: string;
   userId: string;
   userName: string;
   userAvatar?: string | null;
   stream?: MediaStream;
-  audioProducerId?: string;
-  videoProducerId?: string;
   isAudioMuted?: boolean;
   isVideoMuted?: boolean;
   isSpeaking?: boolean;
@@ -31,30 +37,37 @@ interface CallState {
   status: CallStatus;
   activeCall: ActiveCallInfo | null;
   localStream: MediaStream | null;
-  remoteStreams: Record<string, RemoteParticipant>; // socketId or userId -> RemoteParticipant
+  remoteStreams: Record<string, RemoteParticipant>; // keyed by RemoteParticipant.socketId
   isMicMuted: boolean;
   isCameraOff: boolean;
   isScreenSharing: boolean;
   callStartTime: number | null;
   durationSeconds: number;
+  /** Short user-facing message about the last call outcome (declined, busy, failed…). */
+  notice: string | null;
 
   // Actions
   setCallStatus: (status: CallStatus) => void;
   setCallConnected: () => void;
   startCall: (info: ActiveCallInfo, stream?: MediaStream) => void;
   setIncomingCall: (info: ActiveCallInfo) => void;
+  patchActiveCall: (updates: Partial<ActiveCallInfo>) => void;
   setLocalStream: (stream: MediaStream | null) => void;
-  addRemoteParticipant: (participant: RemoteParticipant) => void;
-  removeRemoteParticipant: (id: string) => void;
-  updateRemoteParticipant: (id: string, updates: Partial<RemoteParticipant>) => void;
+  /** Add or replace a participant's stream as a whole (1-on-1 calls). */
+  setRemoteStream: (participant: Omit<RemoteParticipant, "stream">, stream: MediaStream) => void;
+  /** Add one track to a participant, replacing any previous track of the same kind (group calls). */
+  addRemoteTrack: (participant: Omit<RemoteParticipant, "stream">, track: MediaStreamTrack) => void;
+  removeRemoteParticipant: (socketId: string) => void;
+  updateRemoteParticipant: (socketId: string, updates: Partial<RemoteParticipant>) => void;
   toggleMic: () => void;
   toggleCamera: () => void;
   tickTimer: () => void;
+  setNotice: (notice: string | null) => void;
   endCall: () => void;
 }
 
-export const useCallStore = create<CallState>((set, get) => ({
-  status: "idle",
+const initialCallState = {
+  status: "idle" as CallStatus,
   activeCall: null,
   localStream: null,
   remoteStreams: {},
@@ -63,137 +76,112 @@ export const useCallStore = create<CallState>((set, get) => ({
   isScreenSharing: false,
   callStartTime: null,
   durationSeconds: 0,
+};
+
+export const useCallStore = create<CallState>((set, get) => ({
+  ...initialCallState,
+  notice: null,
 
   setCallStatus: (status) => set({ status }),
 
   setCallConnected: () => {
-    set({
-      status: "connected",
-      callStartTime: Date.now(),
-      durationSeconds: 0,
-    });
+    if (get().status === "connected") return;
+    // Keep the running duration when recovering from a reconnect.
+    set((state) => ({ status: "connected", callStartTime: state.callStartTime ?? Date.now() }));
   },
 
   startCall: (info, stream) => {
     set({
+      ...initialCallState,
       status: "calling",
       activeCall: info,
       localStream: stream || null,
-      remoteStreams: {},
-      isMicMuted: false,
-      isCameraOff: false,
-      callStartTime: null,
-      durationSeconds: 0,
+      notice: null,
     });
   },
 
   setIncomingCall: (info) => {
-    set({
-      status: "incoming",
-      activeCall: info,
-      callStartTime: null,
-      durationSeconds: 0,
-    });
+    set({ ...initialCallState, status: "incoming", activeCall: info, notice: null });
+  },
+
+  patchActiveCall: (updates) => {
+    set((state) => (state.activeCall ? { activeCall: { ...state.activeCall, ...updates } } : state));
   },
 
   setLocalStream: (stream) => set({ localStream: stream }),
 
-  addRemoteParticipant: (participant) => {
-    set((state) => {
-      const id = participant.socketId || participant.userId;
-      const existing = state.remoteStreams[id];
-      
-      let finalStream = participant.stream;
-      
-      // If we already have a stream for this user, merge the tracks to prevent overwriting (e.g. audio track followed by video track)
-      if (existing && existing.stream && participant.stream) {
-        finalStream = existing.stream;
-        participant.stream.getTracks().forEach((track) => {
-          // Remove any existing track of the same kind to prevent duplicates
-          const existingTracks = finalStream!.getTracks().filter((t) => t.kind === track.kind);
-          existingTracks.forEach((t) => {
-            finalStream!.removeTrack(t);
-            t.stop();
-          });
-          finalStream!.addTrack(track);
-        });
-      }
+  setRemoteStream: (participant, stream) => {
+    set((state) => ({
+      remoteStreams: {
+        ...state.remoteStreams,
+        [participant.socketId]: {
+          ...state.remoteStreams[participant.socketId],
+          ...participant,
+          // A new MediaStream instance makes <video>/<audio> elements re-bind.
+          stream: new MediaStream(stream.getTracks()),
+        },
+      },
+    }));
+  },
 
+  addRemoteTrack: (participant, track) => {
+    set((state) => {
+      const existing = state.remoteStreams[participant.socketId];
+      const otherTracks = existing?.stream?.getTracks().filter((t) => t.kind !== track.kind) ?? [];
       return {
         remoteStreams: {
           ...state.remoteStreams,
-          [id]: {
+          [participant.socketId]: {
             ...existing,
             ...participant,
-            stream: finalStream,
+            stream: new MediaStream([...otherTracks, track]),
           },
         },
       };
     });
   },
 
-  removeRemoteParticipant: (id) => {
+  removeRemoteParticipant: (socketId) => {
     set((state) => {
+      if (!state.remoteStreams[socketId]) return state;
       const next = { ...state.remoteStreams };
-      delete next[id];
+      delete next[socketId];
       return { remoteStreams: next };
     });
   },
 
-  updateRemoteParticipant: (id, updates) => {
+  updateRemoteParticipant: (socketId, updates) => {
     set((state) => {
-      const existing = state.remoteStreams[id];
+      const existing = state.remoteStreams[socketId];
       if (!existing) return state;
-      return {
-        remoteStreams: {
-          ...state.remoteStreams,
-          [id]: { ...existing, ...updates },
-        },
-      };
+      return { remoteStreams: { ...state.remoteStreams, [socketId]: { ...existing, ...updates } } };
     });
   },
 
   toggleMic: () => {
     const stream = get().localStream;
-    if (stream) {
-      const audioTracks = stream.getAudioTracks();
-      audioTracks.forEach((track) => {
-        track.enabled = !track.enabled;
-      });
-      set((state) => ({ isMicMuted: !state.isMicMuted }));
-    }
+    if (!stream) return;
+    const muted = !get().isMicMuted;
+    stream.getAudioTracks().forEach((track) => (track.enabled = !muted));
+    set({ isMicMuted: muted });
   },
 
   toggleCamera: () => {
     const stream = get().localStream;
-    if (stream) {
-      const videoTracks = stream.getVideoTracks();
-      videoTracks.forEach((track) => {
-        track.enabled = !track.enabled;
-      });
-      set((state) => ({ isCameraOff: !state.isCameraOff }));
-    }
+    if (!stream) return;
+    const off = !get().isCameraOff;
+    stream.getVideoTracks().forEach((track) => (track.enabled = !off));
+    set({ isCameraOff: off });
   },
 
   tickTimer: () => {
     set((state) => ({ durationSeconds: state.durationSeconds + 1 }));
   },
 
+  setNotice: (notice) => set({ notice }),
+
   endCall: () => {
-    const stream = get().localStream;
-    if (stream) {
-      stream.getTracks().forEach((track) => track.stop());
-    }
-    set({
-      status: "idle",
-      activeCall: null,
-      localStream: null,
-      remoteStreams: {},
-      isMicMuted: false,
-      isCameraOff: false,
-      isScreenSharing: false,
-      callStartTime: null,
-      durationSeconds: 0,
-    });
+    get().localStream?.getTracks().forEach((track) => track.stop());
+    set({ ...initialCallState });
   },
 }));

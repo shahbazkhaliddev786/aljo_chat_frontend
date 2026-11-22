@@ -2,9 +2,13 @@ import { api } from "@/shared/lib/api-client";
 import { IMessage } from "@/domains/chat/types";
 
 export const messageService = {
-  getMessages: async (conversationId: string): Promise<IMessage[]> => {
-    const res = await api.get(`/messages/${conversationId}`);
-    return res.data.data.messages;
+  /** A page of messages (oldest first); `before` is the id of the oldest message already loaded. */
+  getMessagesPage: async (
+    conversationId: string,
+    before?: string
+  ): Promise<{ messages: IMessage[]; hasMore: boolean }> => {
+    const res = await api.get(`/messages/${conversationId}`, { params: { limit: 50, ...(before ? { before } : {}) } });
+    return { messages: res.data.data.messages, hasMore: !!res.data.data.hasMore };
   },
 
   sendMessage: async (params: {
@@ -15,9 +19,26 @@ export const messageService = {
     isEncrypted?: boolean;
     ciphertext?: string;
     iv?: string;
+    senderPublicKey?: string;
+    recipientPublicKey?: string;
+    keyEnvelopes?: string;
+    clientMessageId?: string;
     replyToId?: string;
   }): Promise<IMessage> => {
-    const { conversationId, content, file, type, isEncrypted, ciphertext, iv, replyToId } = params;
+    const {
+      conversationId,
+      content,
+      file,
+      type,
+      isEncrypted,
+      ciphertext,
+      iv,
+      senderPublicKey,
+      recipientPublicKey,
+      keyEnvelopes,
+      clientMessageId,
+      replyToId,
+    } = params;
 
     if (file) {
       const formData = new FormData();
@@ -28,6 +49,10 @@ export const messageService = {
       if (isEncrypted) formData.append("isEncrypted", "true");
       if (ciphertext) formData.append("ciphertext", ciphertext);
       if (iv) formData.append("iv", iv);
+      if (senderPublicKey) formData.append("senderPublicKey", senderPublicKey);
+      if (recipientPublicKey) formData.append("recipientPublicKey", recipientPublicKey);
+      if (keyEnvelopes) formData.append("keyEnvelopes", keyEnvelopes);
+      if (clientMessageId) formData.append("clientMessageId", clientMessageId);
 
       const res = await api.post(`/messages/${conversationId}`, formData, {
         headers: { "Content-Type": "multipart/form-data" },
@@ -41,6 +66,10 @@ export const messageService = {
       isEncrypted,
       ciphertext,
       iv,
+      senderPublicKey,
+      recipientPublicKey,
+      keyEnvelopes,
+      clientMessageId,
       replyToId,
     });
     return res.data.data.message;

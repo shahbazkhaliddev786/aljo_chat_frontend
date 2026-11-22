@@ -2,79 +2,67 @@
 
 import { useCallStore } from "@/shared/stores/call.store";
 import { useChatStore } from "@/shared/stores/chat.store";
-import { useDirectCall } from "../hooks/useDirectCall";
-import { useGroupCall } from "../hooks/useGroupCall";
+import { acceptIncomingCall, rejectIncomingCall, hangUp } from "../services/call.controller";
 import IncomingCallModal from "./IncomingCallModal";
 import VideoGrid from "./VideoGrid";
 import AudioCallOverlay from "./AudioCallOverlay";
 import { useQueryClient } from "@tanstack/react-query";
 import { IConversation } from "@/domains/chat/types";
+import { useEffect } from "react";
+import { playRingtone, stopRingtone } from "@/shared/lib/ringtone";
+import { useSpeakingIndicator } from "../hooks/useSpeakingIndicator";
 
 export default function GlobalCallOverlay() {
-  const { status, activeCall, endCall } = useCallStore();
+  const status = useCallStore((s) => s.status);
+  const activeCall = useCallStore((s) => s.activeCall);
+  const notice = useCallStore((s) => s.notice);
   const setActiveConversation = useChatStore((s) => s.setActiveConversation);
   const queryClient = useQueryClient();
 
-  const { acceptCall, rejectCall, terminateCall: terminateDirectCall } = useDirectCall();
-  const { joinGroupCall, leaveGroupCall } = useGroupCall();
+  // Ring while being called; ringback while calling someone.
+  useEffect(() => {
+    if (status === "incoming") playRingtone("incoming");
+    else if (status === "calling") playRingtone("outgoing");
+    else stopRingtone();
+    return stopRingtone;
+  }, [status]);
 
-  if (status === "idle" || !activeCall) return null;
+  useSpeakingIndicator(status === "connected");
+
+  const noticeToast = notice ? (
+    <div
+      role="status"
+      aria-live="polite"
+      className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] px-4 py-2.5 rounded-2xl bg-slate-900 border border-white/10 text-xs text-gray-100 shadow-xl"
+    >
+      {notice}
+    </div>
+  ) : null;
+
+  if (status === "idle" || !activeCall) return noticeToast;
 
   const handleAccept = () => {
     const conversations = queryClient.getQueryData<IConversation[]>(["conversations"]) || [];
     const conversation = conversations.find((c) => c.id === activeCall.conversationId);
-    if (conversation) {
-      setActiveConversation(conversation);
-    }
-
-    if (activeCall.mode === "group") {
-      if (conversation) {
-        joinGroupCall(conversation, activeCall.callType);
-      }
-    } else {
-      if (activeCall.callerSocketId) {
-        acceptCall(activeCall.callerSocketId, activeCall.conversationId, activeCall.callType);
-      }
-    }
+    if (conversation) setActiveConversation(conversation);
+    void acceptIncomingCall(conversation);
   };
 
-  const handleReject = () => {
-    if (activeCall.mode === "group") {
-      endCall();
-    } else {
-      if (activeCall.callerSocketId) {
-        rejectCall(activeCall.callerSocketId);
-      } else {
-        endCall();
-      }
-    }
-  };
-
-  const handleEndCall = () => {
-    if (activeCall.mode === "group") {
-      leaveGroupCall(activeCall.conversationId);
-    } else {
-      terminateDirectCall();
-    }
-  };
+  const handleEndCall = () => hangUp();
 
   // Render Incoming Ringing Modal Over Everything
   if (status === "incoming") {
-    return <IncomingCallModal onAccept={handleAccept} onReject={handleReject} />;
+    return <IncomingCallModal onAccept={handleAccept} onReject={rejectIncomingCall} />;
   }
 
   // Render Connected or Calling Screen Full-Screen Over Everything
-  if (status === "connected" || status === "calling") {
-    return (
-      <div className="fixed inset-0 z-50 flex bg-slate-950 p-4">
-        {activeCall.callType === "video" ? (
-          <VideoGrid onEndCall={handleEndCall} />
-        ) : (
-          <AudioCallOverlay onEndCall={handleEndCall} />
-        )}
-      </div>
-    );
-  }
-
-  return null;
+  return (
+    <div className="fixed inset-0 z-50 flex bg-slate-950 p-4">
+      {activeCall.callType === "video" ? (
+        <VideoGrid onEndCall={handleEndCall} />
+      ) : (
+        <AudioCallOverlay onEndCall={handleEndCall} />
+      )}
+    </div>
+  );
 }

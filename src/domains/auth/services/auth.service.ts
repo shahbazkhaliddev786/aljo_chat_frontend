@@ -11,8 +11,4 @@ export const authService = {
     const res = await api.post("/auth/register", data);
     return res.data.data;
   },
-
-  publishPublicKey: async (publicKey: string): Promise<void> => {
-    await api.patch("/users/public-key", { publicKey });
-  },
 };
