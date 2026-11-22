@@ -16,7 +16,7 @@ import {
 import { startCall } from "@/domains/call/services/call.controller";
 
 import { encryptFile, keyFingerprint } from "@/shared/lib/crypto";
-import { checkContactKey, trustContactKey, KeyTrust } from "@/shared/lib/known-keys";
+import { checkContactKey, trustContactKey, KeyTrust, wasKeyKnown, rememberContactKey } from "@/shared/lib/known-keys";
 import {
   getEncryptionMode,
   encryptForConversation,
@@ -187,6 +187,21 @@ export default function ChatWindow() {
   // Only trust results computed for the partner's *current* key.
   const keyTrust = keyTrustState && keyTrustState.forKey === directPartnerKey ? keyTrustState : null;
 
+  // Remember every member's key (groups too), so a key that later disappears is noticed.
+  const memberKeys = (activeConversation?.members ?? [])
+    .filter((m) => m.id !== currentUser?.id && m.publicKey)
+    .map((m) => `${m.id}|${m.publicKey}`)
+    .join(",");
+  useEffect(() => {
+    if (!currentUser || !memberKeys) return;
+    for (const entry of memberKeys.split(",")) {
+      const [id, key] = [entry.slice(0, entry.indexOf("|")), entry.slice(entry.indexOf("|") + 1)];
+      keyFingerprint(key)
+        .then((fingerprint) => rememberContactKey(currentUser.id, id, fingerprint))
+        .catch(console.error);
+    }
+  }, [currentUser, memberKeys]);
+
   if (!activeConversation) {
     return (
       <div className="flex-1 h-full glass-panel flex flex-col items-center justify-center p-8 text-center bg-slate-950/40">
@@ -218,6 +233,18 @@ export default function ChatWindow() {
   // If anyone has no key yet, messages are sent unencrypted and labelled as such.
   const encryptionMode = getEncryptionMode(activeConversation, currentUser?.id);
   const canEncrypt = encryptionMode.kind !== "none";
+  // Members whose key we have seen before but which is now missing. Sending in
+  // plaintext would silently downgrade an encrypted chat (e.g. a tampering
+  // server removed the key), so sending is blocked instead.
+  const lostKeyMembers = currentUser
+    ? activeConversation.members.filter(
+        (m) => m.id !== currentUser.id && !m.publicKey && wasKeyKnown(currentUser.id, m.id)
+      )
+    : [];
+  const lostKeyMessage =
+    lostKeyMembers.length > 0
+      ? `${lostKeyMembers.map((m) => m.name).join(", ")} no longer ${lostKeyMembers.length === 1 ? "has" : "have"} an encryption key. Messages won't be sent unencrypted; ask them to sign in again.`
+      : null;
   const memberNames = Object.fromEntries(activeConversation.members.map((m) => [m.id, m.name]));
 
   /** Text to show for a message, or undefined while it is still being decrypted. */
@@ -298,6 +325,10 @@ export default function ChatWindow() {
     if (canEncrypt && (!privateKey || !publicKeyJwk)) {
       // Never silently fall back to plaintext in an encrypted chat.
       setSendError(keysMissingMessage);
+      return;
+    }
+    if (!canEncrypt && lostKeyMessage) {
+      setSendError(lostKeyMessage);
       return;
     }
 
@@ -729,6 +760,12 @@ export default function ChatWindow() {
               <button onClick={cancelComposerMode} aria-label="Cancel" className="p-1 text-gray-400 hover:text-white">
                 <X className="w-4 h-4" />
               </button>
+            </div>
+          )}
+
+          {lostKeyMessage && !sendError && (
+            <div role="alert" className="px-4 py-2 bg-rose-500/10 border-t border-rose-500/30 text-xs text-rose-300">
+              {lostKeyMessage}
             </div>
           )}
 

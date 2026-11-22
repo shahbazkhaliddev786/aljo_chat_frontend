@@ -10,6 +10,10 @@ export const messagesKey = (conversationId: string) => ["messages", conversation
  * and may replace an optimistic copy that has the same clientMessageId.
  */
 export function upsertMessage(queryClient: QueryClient, message: IMessage) {
+  // A conversation that was never opened has no cache yet. Creating one with just
+  // this message would look "fresh" and hide the history (and "Load earlier"), so
+  // leave it to be fetched in full when the chat is opened.
+  if (queryClient.getQueryData(messagesKey(message.conversationId)) === undefined) return;
   queryClient.setQueryData<IMessage[]>(messagesKey(message.conversationId), (old = []) => {
     const matchesOptimistic = (m: IMessage) =>
       !!m.localStatus && !!message.clientMessageId && m.clientMessageId === message.clientMessageId;

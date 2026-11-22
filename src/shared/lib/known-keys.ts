@@ -47,3 +47,16 @@ export function trustContactKey(myUserId: string, contactId: string, fingerprint
   data[contactId] = { fingerprint, verified };
   write(myUserId, data);
 }
+
+/** Whether we have ever seen an encryption key for this contact (used to refuse a silent downgrade). */
+export function wasKeyKnown(myUserId: string, contactId: string): boolean {
+  return !!read(myUserId)[contactId];
+}
+
+/** Remember the first key seen for a contact (trust on first use), without changing a known one. */
+export function rememberContactKey(myUserId: string, contactId: string, fingerprint: string) {
+  const data = read(myUserId);
+  if (data[contactId]) return;
+  data[contactId] = { fingerprint, verified: false };
+  write(myUserId, data);
+}

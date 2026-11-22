@@ -112,11 +112,12 @@ export async function getConnectedSocket(timeoutMs = 5_000): Promise<Socket> {
   const socket = useSocketStore.getState().socket;
   if (!socket) throw new Error("offline");
   if (socket.connected) return socket;
-  if (!socket.active) throw new Error("offline");
 
-  // The user is acting now: try to reconnect immediately instead of waiting out
-  // socket.io's exponential backoff (which can be several seconds after an outage).
-  socket.disconnect().connect();
+  // Reconnecting with backoff: the user is acting now, so try immediately instead
+  // of waiting out socket.io's exponential backoff (can be seconds after an outage).
+  // An inactive socket (handshake rejected while the token is being renewed) is
+  // reconnected by the renewal itself, so just wait for it.
+  if (socket.active) socket.disconnect().connect();
 
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
